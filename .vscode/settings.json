@@ -3,7 +3,7 @@
   "idf.toolsPath": "C:/Users/admin/.espressif",
   "idf.pythonBinPath": "C:/Users/admin/.espressif/python_env/idf5.5_py3.14_env/Scripts/python.exe",
   "idf.adapterTargetName": "esp32p4",
-  "idf.port": "COM6",
+  "idf.port": "COM9",
   "idf.flashBaudRate": "460800",
   "idf.flashType": "UART",
   "idf.buildPath": "C:/tmp/AS500-HMI-build",
@@ -12,5 +12,5 @@
     "*.ino": "cpp"
   },
   "idf.currentSetup": "C:/Users/admin/esp-idf-v5.5.3",
-  "idf.portWin": "COM5"
+  "idf.portWin": "COM9"
 }

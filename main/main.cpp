@@ -1677,6 +1677,7 @@ extern "C" void app_main(void)
         usb_serial_jtag_vfs_use_driver();
         g_usb_serial_ready = true;
         printf("USB_RX_READY\n");
+        printf("AS500_BUILD_LCD_DIAG_20260928_1\n");
         fflush(stdout);
     } else {
         ESP_LOGE(TAG, "USB Serial/JTAG driver initialization failed: %s",
@@ -1780,26 +1781,37 @@ extern "C" void app_main(void)
     }
 
     /* ── 디스플레이 + LVGL (BSP) ─────────────────────── */
-    /* Keep the large LVGL draw buffer in PSRAM.  The BSP default requests a
-     * roughly 100 KiB DMA buffer from scarce internal RAM; after the UART,
-     * LiDAR and CAN drivers are initialized that allocation can fail and the
-     * LCD remains in its white power-on state. */
+    /* Match the vendor's working JC1060P470C_I_W_Y LVGL v9 setup. */
     bsp_display_cfg_t disp_cfg = {
-        .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
-        .buffer_size   = BSP_LCD_H_RES * BSP_LCD_V_RES,
-        .double_buffer = false,
+        .lvgl_port_cfg = {
+            .task_priority = 4,
+            .task_stack = 16384,
+            .task_affinity = -1,
+            .task_max_sleep_ms = 500,
+            .task_stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DEFAULT,
+            .timer_period_ms = 5,
+        },
+        .buffer_size   = BSP_LCD_DRAW_BUFF_SIZE,
+        .double_buffer = BSP_LCD_DRAW_BUFF_DOUBLE,
         .flags = {
             .buff_dma    = false,
-            .buff_spiram = true,
-            .sw_rotate   = false,
+            .buff_spiram = false,
+            .sw_rotate   = true,
         },
     };
+    printf("LCD_DIAG: init begin\n");
+    fflush(stdout);
     lv_display_t *disp = bsp_display_start_with_config(&disp_cfg);
     if (disp == NULL) {
         ESP_LOGE(TAG, "Display init FAILED");
+        printf("LCD_DIAG: init FAILED\n");
+        fflush(stdout);
         return;
     }
-    bsp_display_backlight_on();
+    printf("LCD_DIAG: init OK\n");
+    const esp_err_t backlight_err = bsp_display_backlight_on();
+    printf("LCD_DIAG: backlight %s\n", esp_err_to_name(backlight_err));
+    fflush(stdout);
     ESP_LOGI(TAG, "Display %dx%d ready", BSP_LCD_H_RES, BSP_LCD_V_RES);
 
     /* ES_I2C is the BSP bus on GPIO7(SDA)/GPIO8(SCL). Reuse it; never
@@ -1819,6 +1831,12 @@ extern "C" void app_main(void)
         return;
     }
     g_ui.init(g_bot.can_ok);
+    /* Push the first frame before leaving initialization.  This also makes
+       the boot screen deterministic if the LVGL task has not run yet. */
+    lv_obj_invalidate(lv_screen_active());
+    lv_refr_now(disp);
+    printf("LCD_DIAG: first frame rendered\n");
+    fflush(stdout);
     ESP_LOGI(TAG, "Heap after UI: internal=%lu largest=%lu",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));

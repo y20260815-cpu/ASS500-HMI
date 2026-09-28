@@ -30,7 +30,7 @@
         {
             "label": "ESP: Flash",
             "type": "shell",
-            "command": "Set-ExecutionPolicy Bypass -Scope Process -Force; . 'C:\\Users\\admin\\esp-idf-v5.5.3\\export.ps1'; idf.py -B 'C:\\tmp\\AS500-HMI-build' -p COM6 flash",
+            "command": "Set-ExecutionPolicy Bypass -Scope Process -Force; . 'C:\\Users\\admin\\esp-idf-v5.5.3\\export.ps1'; idf.py -B 'C:\\tmp\\AS500-HMI-build' -p COM9 flash",
             "presentation": {
                 "reveal": "always",
                 "panel": "shared"
@@ -40,7 +40,7 @@
         {
             "label": "ESP: Monitor",
             "type": "shell",
-            "command": "Set-ExecutionPolicy Bypass -Scope Process -Force; . 'C:\\Users\\admin\\esp-idf-v5.5.3\\export.ps1'; idf.py -B 'C:\\tmp\\AS500-HMI-build' -p COM6 monitor",
+            "command": "Set-ExecutionPolicy Bypass -Scope Process -Force; . 'C:\\Users\\admin\\esp-idf-v5.5.3\\export.ps1'; idf.py -B 'C:\\tmp\\AS500-HMI-build' -p COM9 monitor",
             "presentation": {
                 "reveal": "always",
                 "panel": "dedicated",
@@ -51,7 +51,7 @@
         {
             "label": "ESP: Build + Flash + Monitor",
             "type": "shell",
-            "command": "Set-ExecutionPolicy Bypass -Scope Process -Force; . 'C:\\Users\\admin\\esp-idf-v5.5.3\\export.ps1'; idf.py -B 'C:\\tmp\\AS500-HMI-build' -p COM6 build flash monitor",
+            "command": "Set-ExecutionPolicy Bypass -Scope Process -Force; . 'C:\\Users\\admin\\esp-idf-v5.5.3\\export.ps1'; idf.py -B 'C:\\tmp\\AS500-HMI-build' -p COM9 build flash monitor",
             "presentation": {
                 "reveal": "always",
                 "panel": "shared",
