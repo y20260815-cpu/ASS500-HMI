@@ -1809,8 +1809,6 @@ extern "C" void app_main(void)
         return;
     }
     printf("LCD_DIAG: init OK\n");
-    const esp_err_t backlight_err = bsp_display_backlight_on();
-    printf("LCD_DIAG: backlight %s\n", esp_err_to_name(backlight_err));
     fflush(stdout);
     ESP_LOGI(TAG, "Display %dx%d ready", BSP_LCD_H_RES, BSP_LCD_V_RES);
 
@@ -1836,6 +1834,9 @@ extern "C" void app_main(void)
     lv_obj_invalidate(lv_screen_active());
     lv_refr_now(disp);
     printf("LCD_DIAG: first frame rendered\n");
+    const esp_err_t backlight_err = bsp_display_backlight_on();
+    printf("LCD_DIAG: backlight after first frame %s\n",
+           esp_err_to_name(backlight_err));
     fflush(stdout);
     ESP_LOGI(TAG, "Heap after UI: internal=%lu largest=%lu",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
