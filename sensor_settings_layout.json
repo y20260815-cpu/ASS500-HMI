@@ -1,0 +1,19 @@
+[
+  {"type":"header","title":"센서설정","buttons":["취소","저장","공장초기화"],"factory_reset":"load_sensor_defaults_without_save"},
+  {"slot":1,"name":"UWB 필터강도","key":"uwb_filter_alpha_percent","default":25,"min":5,"max":100,"step":5,"unit":"%"},
+  {"slot":2,"name":"UWB 이상값한계","key":"uwb_outlier_gate_cm","default":50,"min":5,"max":300,"step":5,"unit":"cm"},
+  {"slot":3,"name":"라이다 경보거리","key":"lidar_warning_cm","default":50,"min":10,"max":500,"step":5,"unit":"cm"},
+  {"slot":4,"name":"라이다 정지거리","key":"lidar_stop_cm","default":100,"min":20,"max":1000,"step":5,"unit":"cm"},
+  {"slot":5,"name":"라이다 감지각도","key":"lidar_center_deg","default":0,"min":-90,"max":90,"step":1,"unit":"deg"},
+  {"slot":6,"name":"라이다 감지범위","key":"lidar_range_deg","default":120,"min":10,"max":360,"step":5,"unit":"deg"},
+  {"slot":7,"name":"라이다 최소신뢰도","key":"lidar_min_confidence","default":20,"min":0,"max":255,"step":5,"unit":""},
+  {"slot":8,"name":"라이다 유지시간","key":"lidar_max_age_ms","default":500,"min":100,"max":2000,"step":50,"unit":"ms"},
+  {"slot":9,"name":"라이다 최대감지거리","key":"lidar_max_distance_cm","default":300,"min":100,"max":600,"step":50,"unit":"cm","affects":"obstacle_search_and_plot_scale"},
+  {"slot":10,"name":"","enabled":false},
+  {"slot":11,"name":"","enabled":false},
+  {"slot":12,"name":"","enabled":false},
+  {"slot":13,"name":"","enabled":false},
+  {"slot":14,"name":"","enabled":false},
+  {"slot":15,"name":"","enabled":false},
+  {"slot":16,"name":"","enabled":false}
+]

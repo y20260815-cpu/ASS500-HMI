@@ -1,0 +1,28 @@
+# ESP-IDF/CMake generated output
+build/
+build_*/
+managed_components/
+sdkconfig.old
+*.elf
+*.bin
+*.map
+!main/espnow/c6_espnow_relay.bin
+
+# Python/editor temporary files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.agents/
+
+# Synology Drive conflict copies
+*_Conflict.*
+*DESKTOP-*
+
+# Accidental nested project copies
+main/main/
+tests/tests/
+tools/tools/
+
+# Operating-system files
+.DS_Store
+Thumbs.db

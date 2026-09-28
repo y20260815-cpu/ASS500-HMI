@@ -1,0 +1,11 @@
+[
+  {"id":"cleaner_settings_bg","label":"Cleaner Settings Background","x":0,"y":0,"w":1024,"h":600,"bg":"#0D1117","bd":"#30363D","bw":1,"r":0,"tx":"#FFFFFF","text":"CLEANER SETTINGS","fs":28,"align":"center"},
+  {"id":"cleaner_output","label":"Cleaning Output","x":112,"y":110,"w":800,"h":120,"bg":"#161B22","bd":"#30363D","bw":1,"r":10,"tx":"#55B7FF","text":"80%","fs":32,"align":"right","min":0,"max":100,"step":1,"default":80,"storage":"NVS","nvs_key":"vac_power"},
+  {"id":"cleaner_runtime","label":"Cleaning Runtime","x":112,"y":250,"w":800,"h":100,"bg":"#161B22","bd":"#30363D","bw":1,"r":10,"tx":"#FFFFFF","text":"00:00:00","fs":28,"align":"right","storage":"NVS_minutes","nvs_key":"vac_run_min"},
+  {"id":"output_minus","label":"Output Minus 1 Percent","x":112,"y":370,"w":190,"h":70,"bg":"#6E40C9","bd":"#0D1117","bw":1,"r":6,"tx":"#FFFFFF","text":"- 1%","fs":18,"align":"center"},
+  {"id":"output_plus","label":"Output Plus 1 Percent","x":312,"y":370,"w":190,"h":70,"bg":"#6E40C9","bd":"#0D1117","bw":1,"r":6,"tx":"#FFFFFF","text":"+ 1%","fs":18,"align":"center"},
+  {"id":"runtime_clear","label":"Runtime Clear","x":512,"y":370,"w":400,"h":70,"bg":"#9E6A03","bd":"#0D1117","bw":1,"r":6,"tx":"#FFFFFF","text":"RUN TIME CLEAR","fs":18,"align":"center"},
+  {"id":"exit","label":"Exit Without Save","x":12,"y":500,"w":320,"h":100,"bg":"#57606A","bd":"#0D1117","bw":1,"r":6,"tx":"#FFFFFF","text":"EXIT","fs":18,"align":"center"},
+  {"id":"save_exit","label":"Save and Exit","x":332,"y":500,"w":360,"h":100,"bg":"#238636","bd":"#0D1117","bw":1,"r":6,"tx":"#FFFFFF","text":"SAVE & EXIT","fs":18,"align":"center"},
+  {"id":"factory_reset","label":"Factory Reset","x":692,"y":500,"w":320,"h":100,"bg":"#B62324","bd":"#0D1117","bw":1,"r":6,"tx":"#FFFFFF","text":"공장초기화","fs":18,"align":"center"}
+]

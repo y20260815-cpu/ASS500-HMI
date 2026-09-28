@@ -1,0 +1,6 @@
+# Fixed-Tag approach test (no time sequence)
+tag_fixed=true
+initial_distance_cm=500
+initial_angle_deg=45
+approach_speed_m_s=1.0
+stop_distance_cm=20
