@@ -46,7 +46,7 @@ typedef enum {
     CMD_TAP_FORWARD, CMD_TAP_REVERSE, CMD_TAP_LEFT, CMD_TAP_RIGHT,
     CMD_FORWARD_LEFT, CMD_FORWARD_RIGHT, CMD_REVERSE_LEFT, CMD_REVERSE_RIGHT,
     CMD_HAZARD_TOGGLE, CMD_HORN_ON, CMD_HORN_OFF,
-    CMD_PUMP_TOGGLE, CMD_BLOWER_TOGGLE,
+    CMD_PUMP_TOGGLE, CMD_BLOWER_TOGGLE, CMD_ENGINE_FAN_TOGGLE,
     CMD_HEADLIGHT_TOGGLE, CMD_PARKING_LIGHT_TOGGLE,
 } control_cmd_t;
 
@@ -69,16 +69,37 @@ typedef struct {
     int16_t       can_command_right; /* calculated target only, 10 = 1% */
     robot_state_t state;
     bool          can_ok;
-    bool          can_rx_ok;             /* fresh STM32 0x5B8 response */
+    bool          can_rx_ok;             /* fresh STM32 0x5A0 response */
     uint16_t      can_voltage_decivolts; /* battery voltage in 0.1 V */
     uint16_t      can_current_deciamps;  /* battery current in 0.1 A */
     uint16_t      can_rx_age_ms;
     int16_t       can_motor1_rpm;
     int16_t       can_motor2_rpm;
-    uint8_t       can_motor_temperature_c;
-    uint8_t       can_fet_temperature_c;
+    uint16_t      can_motion_age_ms;
+    bool          can_motion_valid;
+    bool          can_motion_brake_applied;
+    uint16_t      interface_gpio_input_state;
+    uint8_t       interface_gpio_output_state;
+    uint8_t       interface_throttle1;
+    uint8_t       interface_throttle2;
+    uint8_t       interface_vr1;
+    uint8_t       interface_vr2;
+    uint16_t      interface_analog_age_ms;
+    bool          interface_analog_valid;
+    uint8_t       can_motor_temperature_c; /* unavailable in 0x5A0 */
+    int8_t        can_fet_temperature_c;
+    uint8_t       can_relay_status;
+    uint8_t       can_switch_status;
+    uint8_t       can_error_code;
     bool          can_brake_applied; // Driver-reported relay command
-    bool          can_emergency;
+    bool          can_emergency;     // 0x5A0 has no E-stop bit
+    uint16_t      steering_angle_raw;
+    float         steering_angle_deg;
+    float         steering_speed_dps;
+    int16_t       steering_turns;
+    float         steering_temperature_c;
+    uint16_t      steering_age_ms;
+    bool          steering_valid;
     bool          gpio_emergency;
     bool          uart_command_valid;
     uint8_t       uart_command_type; /* 1=M motor, 2=D distance */
@@ -92,6 +113,7 @@ typedef struct {
     bool          horn_on;
     bool          pump_on;
     bool          blower_on;
+    bool          engine_fan_on;
     bool          headlight_on;
     bool          parking_light_on;
     bool          lidar_ok;
@@ -105,6 +127,7 @@ typedef struct {
     bool          imu_valid;
     float         imu_pitch_deg;
     float         imu_roll_deg;
+    uint8_t       tilt_alarm; /* 0=normal, 1=pitch, 2=roll */
 } robot_t;
 
 /* ═══════════════════════════════════════════════════════════
@@ -134,11 +157,19 @@ public:
 
     /** Return and clear the latest HMI control command. */
     static control_cmd_t takeCommand();
-    /** Select the direction used by Cruise. Future external FNR switches call this. */
+    /** Apply the physical FNR selector received from AS500-interface. */
     static bool setVehicleFNR(control_cmd_t direction);
+    /** Apply the momentary cruise key received from AS500-interface. */
+    static void setInterfaceCruisePressed(bool pressed);
+    /** True while either the Interface or P4 cruise key is held. */
+    static bool cruisePressed();
     static bool touchPoints(const uint16_t *x, const uint16_t *y, uint8_t count);
     static void loadSettings();
     static float settingValue(int index);
+    static float as48SettingValue(int index);
+    /** Apply the saved OFFSET/MAX calibration to Interface analog channel
+        0=Throttle1, 1=Throttle2, 2=VR1, 3=VR2. */
+    static uint8_t calibratedAnalogValue(int channel, uint8_t raw);
     static bool setFollowTurnRpm(float rpm);
     static bool setFollowSimulatorSettings(float max_speed_m_s,
                                            float stop_distance_mm,
@@ -156,22 +187,33 @@ public:
 
 private:
     static void buttonEvent(lv_event_t *e);
+    static void auxiliaryButtonEvent(lv_event_t *e);
     static void manualButtonEvent(lv_event_t *e);
     static void cruiseButtonEvent(lv_event_t *e);
     static void currentGaugeEvent(lv_event_t *e);
     static void tripResetEvent(lv_event_t *e);
+    static void tiltZeroEvent(lv_event_t *e);
+    static void tiltSettingsEvent(lv_event_t *e);
+    static void tiltSettingRowEvent(lv_event_t *e);
+    void createTiltSettingsOverlay(lv_obj_t *screen);
+    static void analogSettingsTouchEvent(lv_event_t *e);
+    static void analogSettingsLongPressTimer(lv_timer_t *timer);
+    static bool openAnalogSettings();
+    static void analogSettingsEvent(lv_event_t *e);
+    static void analogSettingAdjustEvent(lv_event_t *e);
+    void createAnalogSettingsOverlay(lv_obj_t *screen);
+    void refreshAnalogSettings();
     static void mp3TileEvent(lv_event_t *e);
     static void mp3SettingsEvent(lv_event_t *e);
     void createMp3SettingsOverlay();
     void refreshMp3Settings();
-    static void toggleCruise();
     static void vacuumButtonEvent(lv_event_t *e);
     static void vacuumSettingsEvent(lv_event_t *e);
     static void vehicleDrawEvent(lv_event_t *e);
     void createVacuumSettingsOverlay();
     static std::atomic<control_cmd_t> s_pending_cmd;
     static std::atomic<control_cmd_t> s_vehicle_fnr;
-    static std::atomic<bool> s_cruise_active;
+    static std::atomic<bool> s_interface_cruise_pressed;
     /* ── 헤더 ──────────────────────── */
     lv_obj_t *m_led_l    = nullptr;
     lv_obj_t *m_led_r    = nullptr;
@@ -273,19 +315,43 @@ private:
     double m_dash_trip_km = 0.0;
     uint32_t m_dash_distance_tick_ms = 0;
     lv_obj_t *m_dash_spray_gauge = nullptr;
-    lv_obj_t *m_dash_fuel_gauge = nullptr;
+    lv_obj_t *m_dash_speed_limit_gauge = nullptr;
+    lv_obj_t *m_dash_speed_limit_tile = nullptr;
     lv_obj_t *m_dash_steering_gauge = nullptr;
+    lv_obj_t *m_dash_rpm_gauge = nullptr;
+    lv_obj_t *m_dash_rpm_value = nullptr;
+    lv_obj_t *m_dash_parking_brake = nullptr;
+    int8_t m_dash_parking_brake_visual = -1;
     lv_obj_t *m_dash_battery_gauge = nullptr;
     lv_obj_t *m_dash_current_gauge = nullptr;
     lv_obj_t *m_dash_battery_value = nullptr;
     lv_obj_t *m_dash_battery_voltage_value = nullptr;
+    int16_t m_dash_battery_gauge_soc = -2;
+    int16_t m_dash_battery_gauge_warning = -1;
+    int16_t m_dash_battery_text_soc = -2;
+    uint16_t m_dash_battery_text_voltage = 0xFFFFu;
     lv_obj_t *m_dash_current_value = nullptr;
     lv_obj_t *m_dash_current_scale = nullptr;
     lv_obj_t *m_dash_temperature = nullptr;
     lv_obj_t *m_dash_pitch = nullptr;
     lv_obj_t *m_dash_roll = nullptr;
+    lv_obj_t *m_dash_pitch_level = nullptr;
+    lv_obj_t *m_dash_roll_level = nullptr;
+    bool m_dash_imu_valid = false;
+    float m_dash_pitch_deg = 0.0f;
+    float m_dash_roll_deg = 0.0f;
+    lv_obj_t *m_dash_speed_limit_value = nullptr;
+    lv_obj_t *m_dash_spray_value = nullptr;
+    lv_obj_t *m_analog_settings = nullptr;
+    lv_obj_t *m_analog_setting_values[8] = {};
+    lv_obj_t *m_analog_raw_values[4] = {};
+    lv_obj_t *m_analog_calibrated_values[4] = {};
+    lv_obj_t *m_analog_status = nullptr;
+    uint8_t m_analog_raw[4] = {};
     int m_dash_current_max_amps = 100;
     lv_obj_t *m_dash_can = nullptr;
+    lv_obj_t *m_dash_fnr_box = nullptr;
+    lv_obj_t *m_dash_fnr_title = nullptr;
     lv_obj_t *m_dash_fnr = nullptr;
     lv_obj_t *m_dash_cruise = nullptr;
     lv_obj_t *m_dash_cruise_label = nullptr;
@@ -297,8 +363,14 @@ private:
     lv_obj_t *m_dash_turn_left = nullptr;
     lv_obj_t *m_dash_turn_right = nullptr;
     lv_obj_t *m_dash_brake = nullptr;
+    lv_obj_t *m_dash_brake_tile = nullptr;
+    lv_obj_t *m_dash_brake_caption = nullptr;
+    int8_t m_dash_brake_visual = -1;
     lv_obj_t *m_dash_obstacle = nullptr;
     lv_obj_t *m_dash_tilt = nullptr;
+    lv_obj_t *m_dash_tilt_tile = nullptr;
+    lv_obj_t *m_dash_tilt_caption = nullptr;
+    int8_t m_dash_tilt_alarm_visual = -1;
     lv_obj_t *m_dash_spray = nullptr;
     lv_obj_t *m_dash_wired = nullptr;
     lv_obj_t *m_dash_wireless = nullptr;
@@ -313,4 +385,7 @@ private:
     bool m_mp3_long_pressed = false;
     int8_t m_mp3_visual = -1;
     lv_obj_t *m_dash_ros = nullptr;
+    lv_obj_t *m_dash_engine_fan_tile = nullptr;
+    lv_obj_t *m_dash_engine_fan_caption = nullptr;
+    int8_t m_dash_engine_fan_visual = -1;
 };

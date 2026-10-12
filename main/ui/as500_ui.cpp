@@ -24,6 +24,7 @@
  */
 
 #include "as500_ui.h"
+#include "../can/can_protocol.h"
 #include "../manual_input.h"
 #include "../uwb_geometry.h"
 #include "as_logo.h"
@@ -33,8 +34,11 @@
 #include "as500_mp3_player.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "freertos/task.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include <algorithm>
+#include <cstring>
 #include <math.h>
 
 /* ─── 디스플레이 해상도 ─────────────────────────────────── */
@@ -50,16 +54,28 @@ static constexpr int kSettingCount = 27;
 /* Allows the LiDAR overlay to be isolated without removing acquisition. */
 static constexpr bool kLidarOverlayEnabled = true;
 
+/* LVGL's built-in printf formatter may be configured without float support. */
+static void set_tilt_label(lv_obj_t *canvas, bool valid, float degrees);
+
 std::atomic<control_cmd_t> AS500UI::s_pending_cmd{CMD_NONE};
 std::atomic<control_cmd_t> AS500UI::s_vehicle_fnr{CMD_NONE};
-std::atomic<bool> AS500UI::s_cruise_active{false};
+std::atomic<bool> AS500UI::s_interface_cruise_pressed{false};
 static ManualPress s_manual_press;
-static lv_obj_t *s_direction_buttons[6] = {};
 static lv_obj_t *s_touch_stop = nullptr, *s_touch_estop = nullptr;
 static lv_obj_t *s_touch_cruise = nullptr;
-static unsigned s_touch_keys = 0;
 static bool s_touch_release_required = false;
-static bool s_touch_cruise_pressed = false;
+static std::atomic<bool> s_touch_cruise_pressed{false};
+static bool s_physical_touch_down = false;
+
+static control_cmd_t cruise_transition_command(bool was_pressed,
+                                                bool is_pressed,
+                                                control_cmd_t direction)
+{
+    if (was_pressed == is_pressed) return CMD_NONE;
+    if (!is_pressed) return CMD_STOP;
+    return direction == CMD_FORWARD || direction == CMD_REVERSE
+        ? direction : CMD_STOP;
+}
 
 enum Mp3UiAction : uintptr_t {
     MP3_UI_CLOSE = 1,
@@ -69,16 +85,11 @@ enum Mp3UiAction : uintptr_t {
     MP3_UI_TRACK_BASE = 100,
 };
 static void register_touch_button(lv_obj_t *button, control_cmd_t cmd) {
-    if (cmd == CMD_FORWARD) s_direction_buttons[0] = button;
-    if (cmd == CMD_REVERSE) s_direction_buttons[1] = button;
-    if (cmd == CMD_LEFT) s_direction_buttons[2] = button;
-    if (cmd == CMD_RIGHT) s_direction_buttons[3] = button;
-    if (cmd == CMD_HEADLIGHT_TOGGLE) s_direction_buttons[4] = button;
-    if (cmd == CMD_PARKING_LIGHT_TOGGLE) s_direction_buttons[5] = button;
     if (cmd == CMD_STOP) s_touch_stop = button;
     if (cmd == CMD_ESTOP) s_touch_estop = button;
 }
 static lv_obj_t *s_settings_overlay = nullptr;
+static lv_obj_t *s_row_settings_overlay = nullptr;
 static AS500UI *s_ui_instance = nullptr;
 static lv_obj_t *s_settings_saved_popup = nullptr;
 static lv_obj_t *s_setting_rows[20] = {};
@@ -88,13 +99,16 @@ static lv_obj_t *s_settings_title_canvas = nullptr;
 static lv_obj_t *s_lidar_range_canvas = nullptr;
 static int s_setting_selected = 0;
 static constexpr int kVisibleSettingCount = 16;
-enum class SettingsPage { Control, Sensor };
+enum class SettingsPage { Control, Sensor, Analog };
 static SettingsPage s_settings_page = SettingsPage::Control;
 static const int s_control_setting_map[16] = {
     0, 1, 2, 3, 4, 5, 23, 24, 8, 9, 14, 15, 21, 22, 6, 7
 };
 static const int s_sensor_setting_map[16] = {
     16, 17, 10, 11, 12, 13, 18, 19, 20, 26, -1, -1, -1, -1, -1, -1
+};
+static const int s_analog_setting_map[16] = {
+    0, 1, 2, 3, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1
 };
 static const char *s_control_setting_names[16] = {
     "01   정지거리", "02   최대 추정거리",
@@ -110,6 +124,13 @@ static const char *s_sensor_setting_names[16] = {
     "05   라이다 감지각도", "06   라이다 감지범위",
     "07   라이다 최소신뢰도", "08   라이다 유지시간",
     "09   라이다 최대감지거리", "10   음영영역 배율", "", "", "", "", "", ""};
+static const char *s_analog_setting_names[16] = {
+    "01   THROTTLE 1 OFFSET", "02   THROTTLE 1 MAX",
+    "03   THROTTLE 2 OFFSET", "04   THROTTLE 2 MAX",
+    "05   VR 1 OFFSET",       "06   VR 1 MAX",
+    "07   VR 2 OFFSET",       "08   VR 2 MAX",
+    "", "", "", "", "", "", "", ""
+};
 static const float s_setting_defaults[kSettingCount] = {
     20, 2000, 1.0f, 0.3f, 0.5f, 0.5f, 0.5f, 0.5f, 42.0f, 300,
     50, 100, 0, 120, 50, 100, 10, 150, 20, 500, 300, 80, 0, 2.0f, 100, 500, 3
@@ -134,30 +155,124 @@ static const float s_setting_max[kSettingCount] = {
 
 static bool s_vacuum_runtime_reset_requested = false;
 
+/* Interface analog input calibration, stored as OFFSET/MAX pairs for
+   Throttle1, Throttle2, VR1 and VR2. */
+static constexpr int kAnalogChannelCount = 4;
+static uint8_t s_analog_calibration[kAnalogChannelCount][2] = {
+    {0, 255}, {0, 255}, {0, 255}, {0, 255}
+};
+static uint8_t s_analog_calibration_on_open[kAnalogChannelCount][2] = {};
+static uint8_t s_analog_raw[kAnalogChannelCount] = {};
+static lv_timer_t *s_analog_settings_long_press_timer = nullptr;
+
+static constexpr uint32_t kAnalogTextColor = 0xF4F7F5;
+
+static lv_obj_t *create_analog_text_canvas(lv_obj_t *parent, int x, int y,
+                                           int width, int height,
+                                           const char *text)
+{
+    lv_obj_t *canvas = lv_canvas_create(parent);
+    lv_obj_set_pos(canvas, x, y);
+    lv_obj_set_size(canvas, width, height);
+    lv_obj_clear_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
+    void *buffer = heap_caps_calloc((size_t)width * height, 4,
+                                    MALLOC_CAP_SPIRAM);
+    if (!buffer) {
+        ESP_LOGE("AS500UI", "Failed to allocate analog text canvas");
+        lv_obj_delete(canvas);
+        return nullptr;
+    }
+    lv_canvas_set_buffer(canvas, buffer, width, height,
+                         LV_COLOR_FORMAT_ARGB8888);
+    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_TRANSP);
+    const int text_width = ycb_hangul_measure(text, 2);
+    ycb_hangul_draw(canvas, std::max(0, (width - text_width) / 2),
+                    std::max(0, (height - 32) / 2),
+                    lv_color_hex(kAnalogTextColor), lv_color_black(),
+                    text, 2, true);
+    return canvas;
+}
+
+static void update_analog_text_canvas(lv_obj_t *canvas, const char *text)
+{
+    if (!canvas) return;
+    const int width = lv_obj_get_width(canvas);
+    const int height = lv_obj_get_height(canvas);
+    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_TRANSP);
+    const int text_width = ycb_hangul_measure(text, 2);
+    ycb_hangul_draw(canvas, std::max(0, (width - text_width) / 2),
+                    std::max(0, (height - 32) / 2),
+                    lv_color_hex(kAnalogTextColor), lv_color_black(),
+                    text, 2, true);
+}
+
+static void load_analog_calibration()
+{
+    nvs_handle_t h;
+    if (nvs_open("analog_cfg", NVS_READONLY, &h) == ESP_OK) {
+        size_t size = sizeof(s_analog_calibration);
+        if (nvs_get_blob(h, "ranges", s_analog_calibration, &size) != ESP_OK ||
+            size != sizeof(s_analog_calibration)) {
+            const uint8_t defaults[kAnalogChannelCount][2] = {
+                {0, 255}, {0, 255}, {0, 255}, {0, 255}
+            };
+            memcpy(s_analog_calibration, defaults, sizeof(defaults));
+        }
+        nvs_close(h);
+    }
+    for (int i = 0; i < kAnalogChannelCount; ++i) {
+        if (s_analog_calibration[i][1] <= s_analog_calibration[i][0]) {
+            s_analog_calibration[i][0] = 0;
+            s_analog_calibration[i][1] = 255;
+        }
+    }
+}
+
+static bool save_analog_calibration()
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("analog_cfg", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE("AS500UI", "ADC calibration NVS open failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    err = nvs_set_blob(h, "ranges", s_analog_calibration,
+                       sizeof(s_analog_calibration));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGE("AS500UI", "ADC calibration NVS save failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
 /* AS48-compatible setup menu used by the AS500 dashboard. */
 static constexpr int kAs48SettingCount = 25;
-static constexpr int kAs48RowsPerPage = 5;
-static int s_as48_page = 0;
 static lv_obj_t *s_as48_title = nullptr;
-static lv_obj_t *s_as48_names[kAs48RowsPerPage] = {};
-static lv_obj_t *s_as48_values[kAs48RowsPerPage] = {};
+static lv_obj_t *s_as48_names[kAs48SettingCount] = {};
+static lv_obj_t *s_tilt_settings_overlay = nullptr;
+static lv_obj_t *s_tilt_settings_title = nullptr;
+static lv_obj_t *s_tilt_setting_rows[2] = {};
+static float s_tilt_value_on_open[3] = {};
+static void canvas_fill_rect(lv_obj_t *canvas, int x, int y, int w, int h,
+                             lv_color_t color);
 static const char *s_as48_names_all[kAs48SettingCount] = {
-    "Battery voltage", "Pitch alarm", "Roll alarm", "Tilt alarm",
-    "Pitch offset", "Roll offset", "Max FET temp", "Max motor temp",
-    "Max current", "Accel rate", "Decel rate", "Obstacle stop",
-    "Obstacle slow", "Velocity K", "Brake delay", "Motor 1 reverse",
-    "Motor 2 reverse", "Drive trim", "Motor swap", "Battery warn SOC",
-    "Warning duration", "Motor min PWM", "IMU zero", "JYME02 setup",
-    "Steering reverse"
-};
-static const char *s_as48_page_titles[5] = {
-    "SYSTEM CONFIG", "TILT / TEMPERATURE", "DRIVE PARAMETERS",
-    "WHEEL / OBSTACLE", "BATTERY WARNING"
+    "배터리 전압", "기울기 경보 각도", "롤 경보(호환)", "기울기 경보",
+    "피치 보정", "롤 보정", "최대 FET 온도", "최대 모터 온도",
+    "최대 전류", "가속 시간", "감속 시간", "장애물 정지 거리",
+    "장애물 감속 거리", "속도 계수", "브레이크 지연", "모터 1 역방향",
+    "모터 2 역방향", "구동 보정", "모터 좌우 교환", "배터리 경보 잔량",
+    "경보 지속 시간", "모터 최소 PWM", "IMU 영점", "JYME02 설정",
+    "조향 역방향"
 };
 static float s_as48_value[kAs48SettingCount] = {
     48, 15, 15, 1, 0, 0, 90, 90, 300, 1.0f, 1.0f, 0.3f, 1.5f,
     1.0f, 200, 0, 0, 0, 0, 20, 30, 10, 0, 0, 0
 };
+static float s_as48_value_on_open[kAs48SettingCount] = {};
 static const float s_as48_min[kAs48SettingCount] = {
     12, 1, 1, 0, -180, -180, 60, 60, 50, .1f, .1f, .1f, .5f,
     .1f, 0, 0, 0, -1, 0, 5, 10, 5, 0, 0, 0
@@ -171,18 +286,41 @@ static const float s_as48_step[kAs48SettingCount] = {
     .1f, 50, 1, 1, .1f, 1, 1, 10, 1, 1, 1, 1
 };
 
+static bool as48_is_on_off(int index)
+{
+    return index == 3 || index == 15 || index == 16 ||
+           index == 18 || index == 24;
+}
+
+static bool as48_is_menu_item(int index)
+{
+    /* Tilt alarm (1/2/3), offsets (4/5), and IMU zero (22) are managed by
+       the dedicated dashboard Pitch/Roll long-press screen. */
+    return index > 0 && index < kAs48SettingCount &&
+           index != 1 && index != 2 && index != 3 &&
+           index != 4 && index != 5 && index != 22;
+}
+
+static int as48_menu_number(int index)
+{
+    int number = 0;
+    for (int i = 1; i <= index; ++i)
+        if (as48_is_menu_item(i)) ++number;
+    return number;
+}
+
 static void as48_format_value(int index, char *out, size_t size)
 {
     if (index < 0 || index >= kAs48SettingCount) {
         snprintf(out, size, "--");
         return;
     }
-    if (index == 3 || index == 15 || index == 16 || index == 18 || index == 24)
+    if (as48_is_on_off(index))
         snprintf(out, size, "%s", s_as48_value[index] >= .5f ? "ON" : "OFF");
     else if (index == 22 || index == 23)
-        snprintf(out, size, "%s", s_as48_value[index] >= .5f ? "READY" : "RUN");
+        snprintf(out, size, "%s", s_as48_value[index] >= .5f ? "준비" : "실행");
     else if (index == 9 || index == 10)
-        snprintf(out, size, "%.1f s", (double)s_as48_value[index]);
+        snprintf(out, size, "%.1f 초", (double)s_as48_value[index]);
     else if (index == 11 || index == 12)
         snprintf(out, size, "%.2f m", (double)s_as48_value[index]);
     else if (index == 13 || index == 17)
@@ -194,7 +332,7 @@ static void as48_format_value(int index, char *out, size_t size)
     else if (index == 0)
         snprintf(out, size, "%.0f V", (double)s_as48_value[index]);
     else if (index >= 1 && index <= 5)
-        snprintf(out, size, "%.0f deg", (double)s_as48_value[index]);
+        snprintf(out, size, "%.0f 도", (double)s_as48_value[index]);
     else if (index == 6 || index == 7)
         snprintf(out, size, "%.0f C", (double)s_as48_value[index]);
     else if (index == 8)
@@ -203,24 +341,60 @@ static void as48_format_value(int index, char *out, size_t size)
         snprintf(out, size, "%.0f", (double)s_as48_value[index]);
 }
 
+static void as48_draw_row(int index)
+{
+    if (!as48_is_menu_item(index) || !s_as48_names[index]) return;
+    const lv_color_t row_bg = lv_color_hex(0x263936);
+    lv_obj_t *row = s_as48_names[index];
+    char name[64], value[32];
+    snprintf(name, sizeof(name), "%02d  %s", as48_menu_number(index),
+             s_as48_names_all[index]);
+    as48_format_value(index, value, sizeof(value));
+    lv_canvas_fill_bg(row, row_bg, LV_OPA_COVER);
+    ycb_hangul_draw(row, 16, 16, lv_color_hex(0xDCE8E3), row_bg,
+                    name, 2, false);
+    const int value_width = ycb_hangul_measure(value, 2);
+    ycb_hangul_draw(row, std::max(570, 760 - value_width), 16,
+                    lv_color_hex(0x9ED5B8), row_bg, value, 2, false);
+
+    const lv_color_t minus_bg = lv_color_hex(0x526D64);
+    const lv_color_t plus_bg = lv_color_hex(0x4E8974);
+    canvas_fill_rect(row, 772, 6, 80, 52, minus_bg);
+    canvas_fill_rect(row, 866, 6, 80, 52, plus_bg);
+    if (as48_is_on_off(index)) {
+        ycb_hangul_draw(row, 788, 16, lv_color_white(), minus_bg,
+                        "OFF", 2, false);
+        ycb_hangul_draw(row, 890, 16, lv_color_white(), plus_bg,
+                        "ON", 2, false);
+    } else {
+        ycb_hangul_draw(row, 796, 16, lv_color_white(), minus_bg,
+                        "-", 2, false);
+        ycb_hangul_draw(row, 890, 16, lv_color_white(), plus_bg,
+                        "+", 2, false);
+    }
+    lv_obj_invalidate(row);
+}
+
 static void as48_refresh()
 {
     if (!s_as48_title) return;
-    char title[64];
-    snprintf(title, sizeof(title), "%s   %d / 5", s_as48_page_titles[s_as48_page], s_as48_page + 1);
-    lv_label_set_text(s_as48_title, title);
-    for (int row = 0; row < kAs48RowsPerPage; ++row) {
-        const int index = s_as48_page * kAs48RowsPerPage + row;
-        char name[48], value[24];
-        snprintf(name, sizeof(name), "%02d  %s", index + 1, s_as48_names_all[index]);
-        as48_format_value(index, value, sizeof(value));
-        lv_label_set_text(s_as48_names[row], name);
-        lv_label_set_text(s_as48_values[row], value);
+    const lv_color_t overlay_bg = lv_color_hex(0x17211F);
+    lv_canvas_fill_bg(s_as48_title, overlay_bg, LV_OPA_COVER);
+    ycb_hangul_draw(s_as48_title, 0, 10, lv_color_hex(0xE8F1ED),
+                    overlay_bg, "차량 설정", 2, false);
+    lv_obj_invalidate(s_as48_title);
+    for (int index = 1; index < kAs48SettingCount; ++index) {
+        if (!as48_is_menu_item(index)) continue;
+        as48_draw_row(index);
+        vTaskDelay(1);
     }
 }
 
 static void as48_save_all()
 {
+    s_as48_value[0] = 48.0f;
+    /* Keep the legacy roll threshold slot synchronized for compatibility. */
+    s_as48_value[2] = s_as48_value[1];
     nvs_handle_t h;
     if (nvs_open("as48_cfg", NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_blob(h, "values", s_as48_value, sizeof(s_as48_value));
@@ -233,37 +407,98 @@ static void as48_event(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED &&
         lv_event_get_code(e) != LV_EVENT_LONG_PRESSED_REPEAT) return;
     const int action = (int)(intptr_t)lv_event_get_user_data(e);
-    if (action == 10 && s_as48_page > 0) --s_as48_page;
-    else if (action == 11 && s_as48_page < 4) ++s_as48_page;
-    else if (action == 12) as48_save_all();
-    else if (action == 13) {
+    if (action == 12) {
         as48_save_all();
         lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
         return;
-    } else if (action >= 100 && action < 110) {
-        const int index = s_as48_page * 5 + action - 100;
+    } else if (action == 13) {
+        std::memcpy(s_as48_value, s_as48_value_on_open,
+                    sizeof(s_as48_value));
+        as48_refresh();
+        lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+        return;
+    } else if (action >= 100 && action < 100 + kAs48SettingCount) {
+        const int index = action - 100;
         s_as48_value[index] = fmaxf(s_as48_min[index], s_as48_value[index] - s_as48_step[index]);
-    } else if (action >= 200 && action < 210) {
-        const int index = s_as48_page * 5 + action - 200;
+    } else if (action >= 200 && action < 200 + kAs48SettingCount) {
+        const int index = action - 200;
         s_as48_value[index] = fminf(s_as48_max[index], s_as48_value[index] + s_as48_step[index]);
     }
     as48_refresh();
 }
 
+static void as48_row_event(lv_event_t *e)
+{
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_CLICKED && code != LV_EVENT_LONG_PRESSED_REPEAT)
+        return;
+    const int index = (int)(intptr_t)lv_event_get_user_data(e);
+    if (index < 0 || index >= kAs48SettingCount) return;
+    lv_indev_t *indev = lv_event_get_indev(e);
+    if (!indev) return;
+    lv_point_t point;
+    lv_area_t area;
+    lv_indev_get_point(indev, &point);
+    lv_obj_get_coords(lv_event_get_target_obj(e), &area);
+    const int x = point.x - area.x1;
+    if (x >= 772 && x < 852) {
+        if (as48_is_on_off(index)) s_as48_value[index] = 0.0f;
+        else s_as48_value[index] = fmaxf(s_as48_min[index],
+            s_as48_value[index] - s_as48_step[index]);
+    } else if (x >= 866 && x < 946) {
+        if (as48_is_on_off(index)) s_as48_value[index] = 1.0f;
+        else s_as48_value[index] = fminf(s_as48_max[index],
+            s_as48_value[index] + s_as48_step[index]);
+    }
+    else
+        return;
+    as48_draw_row(index);
+}
+
 static lv_obj_t *as48_button(lv_obj_t *parent, int x, int y, int w, int h,
-                             const char *text, int action, uint32_t color)
+                             const char *text, int action, uint32_t color,
+                             lv_event_cb_t event_cb = as48_event)
 {
     lv_obj_t *button = lv_obj_create(parent);
     lv_obj_set_pos(button, x, y); lv_obj_set_size(button, w, h);
-    lv_obj_set_style_radius(button, 7, 0);
+    lv_obj_set_style_radius(button, 12, 0);
     lv_obj_set_style_bg_color(button, lv_color_hex(color), 0);
-    lv_obj_set_style_border_width(button, 0, 0);
+    lv_obj_set_style_bg_color(button,
+                              lv_color_darken(lv_color_hex(color), LV_OPA_20),
+                              LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(button, 2, 0);
+    lv_obj_set_style_border_color(button, lv_color_lighten(
+                                  lv_color_hex(color), LV_OPA_50), 0);
+    lv_obj_set_style_border_color(button, lv_color_white(),
+                                  LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(button, 10, 0);
+    lv_obj_set_style_shadow_offset_y(button, 3, 0);
+    lv_obj_set_style_shadow_opa(button, LV_OPA_30, 0);
+    lv_obj_set_style_shadow_color(button, lv_color_black(), 0);
     lv_obj_set_style_pad_all(button, 0, 0);
-    lv_obj_add_event_cb(button, as48_event, LV_EVENT_ALL, (void *)(intptr_t)action);
-    lv_obj_t *lbl = lv_label_create(button);
-    lv_label_set_text(lbl, text); lv_obj_center(lbl);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_set_style_clip_corner(button, true, 0);
+    lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(button, event_cb, LV_EVENT_ALL,
+                        (void *)(intptr_t)action);
+    lv_obj_t *lbl = lv_canvas_create(button);
+    lv_obj_set_size(lbl, w - 8, h - 8);
+    lv_obj_center(lbl);
+    lv_obj_clear_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+    void *label_buf = heap_caps_calloc((size_t)(w - 8) * (h - 8), 4,
+                                       MALLOC_CAP_SPIRAM);
+    if (label_buf) {
+        lv_canvas_set_buffer(lbl, label_buf, w - 8, h - 8,
+                             LV_COLOR_FORMAT_ARGB8888);
+        const lv_color_t bg = lv_color_hex(color);
+        lv_canvas_fill_bg(lbl, bg, LV_OPA_COVER);
+        const int text_width = ycb_hangul_measure(text, 2);
+        ycb_hangul_draw(lbl, std::max(0, (w - 8 - text_width) / 2),
+                        std::max(0, (h - 8 - 32) / 2), lv_color_white(), bg,
+                        text, 2, false);
+    } else {
+        lv_obj_delete(lbl);
+    }
     return button;
 }
 
@@ -275,6 +510,8 @@ static void create_as48_settings(lv_obj_t *screen)
         nvs_get_blob(h, "values", s_as48_value, &size);
         nvs_close(h);
     }
+    /* AS500 is a fixed 48 V vehicle; this is not a user setting. */
+    s_as48_value[0] = 48.0f;
     s_settings_overlay = lv_obj_create(screen);
     lv_obj_set_pos(s_settings_overlay, 0, 0); lv_obj_set_size(s_settings_overlay, 1024, 600);
     lv_obj_set_style_bg_color(s_settings_overlay, lv_color_hex(0x17211F), 0);
@@ -282,37 +519,146 @@ static void create_as48_settings(lv_obj_t *screen)
     lv_obj_set_style_pad_all(s_settings_overlay, 0, 0);
     lv_obj_clear_flag(s_settings_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_as48_title = lv_label_create(s_settings_overlay);
-    lv_obj_set_pos(s_as48_title, 28, 20); lv_obj_set_size(s_as48_title, 760, 36);
-    lv_obj_set_style_text_font(s_as48_title, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(s_as48_title, lv_color_hex(0xE8F1ED), 0);
-
-    for (int row = 0; row < 5; ++row) {
-        lv_obj_t *panel = lv_obj_create(s_settings_overlay);
-        lv_obj_set_pos(panel, 24, 75 + row * 82); lv_obj_set_size(panel, 976, 70);
-        lv_obj_set_style_radius(panel, 7, 0);
-        lv_obj_set_style_bg_color(panel, lv_color_hex(0x263936), 0);
-        lv_obj_set_style_border_color(panel, lv_color_hex(0x425B54), 0);
-        lv_obj_set_style_pad_all(panel, 0, 0);
-        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-        s_as48_names[row] = lv_label_create(panel);
-        lv_obj_set_pos(s_as48_names[row], 20, 23); lv_obj_set_size(s_as48_names[row], 530, 28);
-        lv_obj_set_style_text_font(s_as48_names[row], &lv_font_montserrat_18, 0);
-        lv_obj_set_style_text_color(s_as48_names[row], lv_color_hex(0xDCE8E3), 0);
-        s_as48_values[row] = lv_label_create(panel);
-        lv_obj_set_pos(s_as48_values[row], 560, 20); lv_obj_set_size(s_as48_values[row], 180, 30);
-        lv_obj_set_style_text_align(s_as48_values[row], LV_TEXT_ALIGN_RIGHT, 0);
-        lv_obj_set_style_text_font(s_as48_values[row], &lv_font_montserrat_20, 0);
-        lv_obj_set_style_text_color(s_as48_values[row], lv_color_hex(0x9ED5B8), 0);
-        as48_button(panel, 770, 9, 82, 52, "-", 100 + row, 0x526D64);
-        as48_button(panel, 870, 9, 82, 52, "+", 200 + row, 0x4E8974);
+    s_as48_title = lv_canvas_create(s_settings_overlay);
+    lv_obj_set_pos(s_as48_title, 28, 14);
+    lv_obj_set_size(s_as48_title, 540, 52);
+    void *title_buf = heap_caps_calloc(540 * 52, 4, MALLOC_CAP_SPIRAM);
+    if (title_buf)
+        lv_canvas_set_buffer(s_as48_title, title_buf, 540, 52,
+                             LV_COLOR_FORMAT_ARGB8888);
+    else {
+        lv_obj_delete(s_as48_title);
+        s_as48_title = nullptr;
     }
-    as48_button(s_settings_overlay, 24, 510, 150, 64, LV_SYMBOL_LEFT " PREV", 10, 0x526D64);
-    as48_button(s_settings_overlay, 190, 510, 150, 64, "NEXT " LV_SYMBOL_RIGHT, 11, 0x526D64);
-    as48_button(s_settings_overlay, 686, 510, 140, 64, LV_SYMBOL_SAVE " SAVE", 12, 0x386F84);
-    as48_button(s_settings_overlay, 842, 510, 158, 64, LV_SYMBOL_CLOSE " CLOSE", 13, 0x8A554D);
+
+    lv_obj_t *list = lv_obj_create(s_settings_overlay);
+    lv_obj_set_pos(list, 16, 82);
+    lv_obj_set_size(list, 992, 502);
+    lv_obj_set_style_bg_color(list, lv_color_hex(0x17211F), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 8, 0);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+
+    int visible_row = 0;
+    for (int index = 1; index < kAs48SettingCount; ++index) {
+        if (!as48_is_menu_item(index)) continue;
+        s_as48_names[index] = lv_canvas_create(list);
+        lv_obj_set_pos(s_as48_names[index], 0, visible_row * 72);
+        lv_obj_set_size(s_as48_names[index], 960, 64);
+        void *row_buf = heap_caps_calloc(960 * 64, 4, MALLOC_CAP_SPIRAM);
+        if (row_buf) {
+            lv_canvas_set_buffer(s_as48_names[index], row_buf, 960, 64,
+                                 LV_COLOR_FORMAT_ARGB8888);
+            lv_obj_add_flag(s_as48_names[index], LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_flag(s_as48_names[index], LV_OBJ_FLAG_EVENT_BUBBLE);
+            lv_obj_add_event_cb(s_as48_names[index], as48_row_event,
+                                LV_EVENT_ALL, (void *)(intptr_t)index);
+        } else {
+            lv_obj_delete(s_as48_names[index]);
+            s_as48_names[index] = nullptr;
+        }
+        ++visible_row;
+        vTaskDelay(1);
+    }
+    as48_button(s_settings_overlay, 590, 8, 270, 64,
+                "저장하고 나가기", 12, 0x386F84);
+    as48_button(s_settings_overlay, 874, 8, 130, 64,
+                "나가기", 13, 0x8A554D);
     as48_refresh();
     lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void tilt_settings_draw_row(int slot, int index, const char *name)
+{
+    if (slot < 0 || slot >= 2 || !s_tilt_setting_rows[slot]) return;
+    lv_obj_t *row = s_tilt_setting_rows[slot];
+    const lv_color_t row_bg = lv_color_hex(0x263936);
+    char value[32];
+    as48_format_value(index, value, sizeof(value));
+    lv_canvas_fill_bg(row, row_bg, LV_OPA_COVER);
+    ycb_hangul_draw(row, 20, 16, lv_color_hex(0xDCE8E3), row_bg,
+                    name, 2, false);
+    const int value_width = ycb_hangul_measure(value, 2);
+    ycb_hangul_draw(row, std::max(520, 750 - value_width), 16,
+                    lv_color_hex(0xFFFFFF), row_bg, value, 2, false);
+
+    const bool on_off = index == 3;
+    const lv_color_t left_bg = lv_color_hex(on_off ? 0x6A625C : 0x586D68);
+    const lv_color_t right_bg = lv_color_hex(on_off ? 0x3E8061 : 0x386F84);
+    canvas_fill_rect(row, 772, 4, 80, 56, left_bg);
+    canvas_fill_rect(row, 866, 4, 80, 56, right_bg);
+    ycb_hangul_draw(row, on_off ? 780 : 796, 16, lv_color_white(), left_bg,
+                    on_off ? "OFF" : "-", 2, false);
+    ycb_hangul_draw(row, on_off ? 882 : 890, 16, lv_color_white(), right_bg,
+                    on_off ? "ON" : "+", 2, false);
+    lv_obj_invalidate(row);
+}
+
+static void tilt_settings_refresh()
+{
+    if (s_tilt_settings_title) {
+        const lv_color_t bg = lv_color_hex(0x17211F);
+        lv_canvas_fill_bg(s_tilt_settings_title, bg, LV_OPA_COVER);
+        ycb_hangul_draw(s_tilt_settings_title, 0, 10,
+                        lv_color_hex(0xE8F1ED), bg,
+                        "기울기 설정", 2, false);
+        lv_obj_invalidate(s_tilt_settings_title);
+    }
+    tilt_settings_draw_row(0, 1, "기울기 경보 각도");
+    tilt_settings_draw_row(1, 3, "기울기 경보 사용");
+}
+
+void AS500UI::createTiltSettingsOverlay(lv_obj_t *screen)
+{
+    s_tilt_settings_overlay = lv_obj_create(screen);
+    lv_obj_set_pos(s_tilt_settings_overlay, 0, 0);
+    lv_obj_set_size(s_tilt_settings_overlay, 1024, 600);
+    lv_obj_set_style_bg_color(s_tilt_settings_overlay,
+                              lv_color_hex(0x17211F), 0);
+    lv_obj_set_style_border_width(s_tilt_settings_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_tilt_settings_overlay, 0, 0);
+    lv_obj_clear_flag(s_tilt_settings_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_tilt_settings_title = lv_canvas_create(s_tilt_settings_overlay);
+    lv_obj_set_pos(s_tilt_settings_title, 28, 14);
+    lv_obj_set_size(s_tilt_settings_title, 330, 52);
+    void *title_buf = heap_caps_calloc(330 * 52, 4, MALLOC_CAP_SPIRAM);
+    if (title_buf) {
+        lv_canvas_set_buffer(s_tilt_settings_title, title_buf, 330, 52,
+                             LV_COLOR_FORMAT_ARGB8888);
+    } else {
+        lv_obj_delete(s_tilt_settings_title);
+        s_tilt_settings_title = nullptr;
+    }
+
+    as48_button(s_tilt_settings_overlay, 370, 8, 200, 64,
+                "기울기 영점", 30, 0x786444, tiltSettingsEvent);
+    as48_button(s_tilt_settings_overlay, 590, 8, 270, 64,
+                "저장하고 나가기", 31, 0x386F84, tiltSettingsEvent);
+    as48_button(s_tilt_settings_overlay, 874, 8, 130, 64,
+                "나가기", 32, 0x8A554D, tiltSettingsEvent);
+
+    const int indices[2] = {1, 3};
+    for (int slot = 0; slot < 2; ++slot) {
+        lv_obj_t *row = lv_canvas_create(s_tilt_settings_overlay);
+        s_tilt_setting_rows[slot] = row;
+        lv_obj_set_pos(row, 32, 126 + slot * 82);
+        lv_obj_set_size(row, 960, 64);
+        void *row_buf = heap_caps_calloc(960 * 64, 4, MALLOC_CAP_SPIRAM);
+        if (row_buf) {
+            lv_canvas_set_buffer(row, row_buf, 960, 64,
+                                 LV_COLOR_FORMAT_ARGB8888);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, tiltSettingRowEvent, LV_EVENT_ALL,
+                                (void *)(intptr_t)indices[slot]);
+        } else {
+            lv_obj_delete(row);
+            s_tilt_setting_rows[slot] = nullptr;
+        }
+    }
+    tilt_settings_refresh();
+    lv_obj_add_flag(s_tilt_settings_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void redrawLidarRangeCanvas()
@@ -424,6 +770,22 @@ float AS500UI::settingValue(int index)
     return (index >= 0 && index < kSettingCount) ? s_setting_data[index] : 0.0f;
 }
 
+float AS500UI::as48SettingValue(int index)
+{
+    if (index == 0) return 48.0f;
+    return (index >= 0 && index < kAs48SettingCount) ? s_as48_value[index] : 0.0f;
+}
+
+uint8_t AS500UI::calibratedAnalogValue(int channel, uint8_t raw)
+{
+    if (channel < 0 || channel >= kAnalogChannelCount) return 0;
+    const int offset = s_analog_calibration[channel][0];
+    const int maximum = s_analog_calibration[channel][1];
+    if (raw <= offset) return 0;
+    if (raw >= maximum) return 255;
+    return (uint8_t)(((int)raw - offset) * 255 / (maximum - offset));
+}
+
 static void save_setting_value(int index)
 {
     nvs_handle_t h;
@@ -486,10 +848,13 @@ bool AS500UI::setFollowSimulatorSettings(float max_speed_m_s,
 
 static void refresh_setting_ui(int previous_selected = -1)
 {
+    const bool analog_page = s_settings_page == SettingsPage::Analog;
     const int *map = s_settings_page == SettingsPage::Control
-        ? s_control_setting_map : s_sensor_setting_map;
+        ? s_control_setting_map
+        : analog_page ? s_analog_setting_map : s_sensor_setting_map;
     const char *const *names = s_settings_page == SettingsPage::Control
-        ? s_control_setting_names : s_sensor_setting_names;
+        ? s_control_setting_names
+        : analog_page ? s_analog_setting_names : s_sensor_setting_names;
     for (int slot = 0; slot < kVisibleSettingCount; ++slot) {
         const int index = map[slot];
         if (s_setting_name_canvases[slot] && previous_selected < 0) {
@@ -511,13 +876,20 @@ static void refresh_setting_ui(int previous_selected = -1)
             lv_color_hex(selected ? 0x426B9B : 0x1E293B), 0);
         lv_obj_set_style_border_color(s_setting_rows[slot],
             lv_color_hex(selected ? 0x93C5FD : (index >= 0 ? 0x334155 : 0x1E293B)), 0);
-        if (index < 0 || index >= kSettingCount) {
+        if (index < 0 || (!analog_page && index >= kSettingCount) ||
+            (analog_page && index >= kAnalogChannelCount * 2)) {
             lv_obj_add_flag(s_setting_values[slot], LV_OBJ_FLAG_HIDDEN);
             continue;
         }
         lv_obj_clear_flag(s_setting_values[slot], LV_OBJ_FLAG_HIDDEN);
         char value_text[40];
-        if (index == 1)
+        if (analog_page) {
+            const int channel = index / 2;
+            const int part = index % 2;
+            snprintf(value_text, sizeof(value_text), "%u   RAW %u",
+                     s_analog_calibration[channel][part],
+                     s_analog_raw[channel]);
+        } else if (index == 1)
             snprintf(value_text, sizeof(value_text), "%.0f m", (double)(s_setting_data[index] / 100.0f));
         else if (index == 2 || index == 3)
             snprintf(value_text, sizeof(value_text), "%.1f m/s", (double)s_setting_data[index]);
@@ -559,7 +931,9 @@ static void refresh_setting_ui(int previous_selected = -1)
     }
     if (s_settings_title_canvas && previous_selected < 0) {
         lv_canvas_fill_bg(s_settings_title_canvas, lv_color_hex(0x1E293B), LV_OPA_TRANSP);
-        const char *title = s_settings_page == SettingsPage::Control ? "제어설정" : "센서설정";
+        const char *title = s_settings_page == SettingsPage::Control
+            ? "제어설정"
+            : analog_page ? "ADC CALIBRATION" : "센서설정";
         int width = ycb_hangul_measure(title, 2);
         ycb_hangul_draw(s_settings_title_canvas, (300 - width) / 2, 4,
                         lv_color_hex(0x93C5FD), lv_color_hex(0x1E293B),
@@ -573,8 +947,8 @@ static void savedPopupTimer(lv_timer_t *timer)
     (void)timer;
     if (s_settings_saved_popup)
         lv_obj_add_flag(s_settings_saved_popup, LV_OBJ_FLAG_HIDDEN);
-    if (s_settings_overlay)
-        lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    if (s_row_settings_overlay)
+        lv_obj_add_flag(s_row_settings_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void settingControlEvent(lv_event_t *e)
@@ -583,12 +957,31 @@ static void settingControlEvent(lv_event_t *e)
     if (code != LV_EVENT_CLICKED && code != LV_EVENT_LONG_PRESSED_REPEAT) return;
     int action = (int)(intptr_t)lv_event_get_user_data(e);
     if (action == 4) { /* Cancel: discard staged values. */
+        if (s_settings_page == SettingsPage::Analog) {
+            memcpy(s_analog_calibration, s_analog_calibration_on_open,
+                   sizeof(s_analog_calibration));
+            refresh_setting_ui();
+            if (s_row_settings_overlay)
+                lv_obj_add_flag(s_row_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+            s_settings_page = SettingsPage::Control;
+            return;
+        }
         for (int i = 0; i < kSettingCount; ++i) s_setting_data[i] = s_setting_saved[i];
         refresh_setting_ui();
-        if (s_settings_overlay) lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+        if (s_row_settings_overlay)
+            lv_obj_add_flag(s_row_settings_overlay, LV_OBJ_FLAG_HIDDEN);
         return;
     }
     if (action == 5) { /* Save all values, then return to main. */
+        if (s_settings_page == SettingsPage::Analog) {
+            if (!save_analog_calibration()) return;
+            memcpy(s_analog_calibration_on_open, s_analog_calibration,
+                   sizeof(s_analog_calibration));
+            if (s_row_settings_overlay)
+                lv_obj_add_flag(s_row_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+            s_settings_page = SettingsPage::Control;
+            return;
+        }
         if (s_setting_data[22] >= 0.5f) {
             s_vacuum_runtime_reset_requested = true;
             s_setting_data[22] = 0;
@@ -613,6 +1006,15 @@ static void settingControlEvent(lv_event_t *e)
         return;
     }
     if (action == 6) { /* Stage factory defaults; Save persists them to NVS. */
+        if (s_settings_page == SettingsPage::Analog) {
+            for (int i = 0; i < kAnalogChannelCount; ++i) {
+                s_analog_calibration[i][0] = 0;
+                s_analog_calibration[i][1] = 255;
+            }
+            s_setting_selected = 0;
+            refresh_setting_ui();
+            return;
+        }
         const int *map = s_settings_page == SettingsPage::Control
             ? s_control_setting_map : s_sensor_setting_map;
         for (int slot = 0; slot < kVisibleSettingCount; ++slot) {
@@ -626,7 +1028,9 @@ static void settingControlEvent(lv_event_t *e)
     }
     const int previous_selected = s_setting_selected;
     const int *map = s_settings_page == SettingsPage::Control
-        ? s_control_setting_map : s_sensor_setting_map;
+        ? s_control_setting_map
+        : s_settings_page == SettingsPage::Analog
+            ? s_analog_setting_map : s_sensor_setting_map;
     if (action >= 100 && action < 100 + kVisibleSettingCount) {
         const int slot = action - 100;
         if (map[slot] >= 0) {
@@ -636,6 +1040,22 @@ static void settingControlEvent(lv_event_t *e)
         return;
     }
     const int index = map[s_setting_selected];
+    if (s_settings_page == SettingsPage::Analog) {
+        const int channel = index / 2;
+        const int part = index % 2;
+        int value = s_analog_calibration[channel][part];
+        if (action == 2) --value;
+        if (action == 3) ++value;
+        if (part == 0)
+            value = std::clamp(value, 0,
+                               (int)s_analog_calibration[channel][1] - 1);
+        else
+            value = std::clamp(value,
+                               (int)s_analog_calibration[channel][0] + 1, 255);
+        s_analog_calibration[channel][part] = (uint8_t)value;
+        refresh_setting_ui(previous_selected);
+        return;
+    }
     if (action == 2) s_setting_data[index] -= s_setting_step[index];
     if (action == 3) s_setting_data[index] += s_setting_step[index];
     if (s_setting_data[index] < s_setting_min[index]) s_setting_data[index] = s_setting_min[index];
@@ -649,13 +1069,13 @@ static void settingControlEvent(lv_event_t *e)
 static void lidarSettingsLongPressEvent(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED ||
-        !s_settings_overlay) return;
+        !s_row_settings_overlay) return;
     for (int i = 0; i < kSettingCount; ++i) s_setting_saved[i] = s_setting_data[i];
     s_settings_page = SettingsPage::Sensor;
     s_setting_selected = 0;
     refresh_setting_ui();
-    lv_obj_clear_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(s_settings_overlay);
+    lv_obj_clear_flag(s_row_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_row_settings_overlay);
 }
 
 static void draw_button_korean(lv_obj_t *canvas, const char *text)
@@ -674,7 +1094,6 @@ void AS500UI::buttonEvent(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     control_cmd_t cmd = (control_cmd_t)(uintptr_t)lv_event_get_user_data(e);
-    if (cmd == CMD_STOP || cmd == CMD_ESTOP) s_cruise_active = false;
     if (cmd == CMD_STOP || cmd == CMD_ESTOP || cmd == CMD_FOLLOW_START || cmd == CMD_SETTINGS)
         s_manual_press.cancel();
     if (cmd == CMD_SETTINGS) s_pending_cmd = CMD_STOP;
@@ -688,16 +1107,34 @@ void AS500UI::buttonEvent(lv_event_t *e)
     }
     if (cmd == CMD_SETTINGS && s_settings_overlay != nullptr) {
         if (lv_obj_has_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN)) {
-            s_as48_page = 0;
+            std::memcpy(s_as48_value_on_open, s_as48_value,
+                        sizeof(s_as48_value_on_open));
             as48_refresh();
             lv_obj_clear_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(s_settings_overlay);
         } else {
+            std::memcpy(s_as48_value, s_as48_value_on_open,
+                        sizeof(s_as48_value));
+            as48_refresh();
             lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
         }
         return;
     }
     s_pending_cmd = cmd;
+}
+
+void AS500UI::auxiliaryButtonEvent(lv_event_t *e)
+{
+    const lv_event_code_t code = lv_event_get_code(e);
+    const control_cmd_t cmd =
+        (control_cmd_t)(uintptr_t)lv_event_get_user_data(e);
+    if (cmd == CMD_HORN_ON) {
+        if (code == LV_EVENT_PRESSED) s_pending_cmd = CMD_HORN_ON;
+        else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST)
+            s_pending_cmd = CMD_HORN_OFF;
+        return;
+    }
+    if (code == LV_EVENT_CLICKED) s_pending_cmd = cmd;
 }
 
 void AS500UI::manualButtonEvent(lv_event_t *e)
@@ -707,8 +1144,6 @@ void AS500UI::manualButtonEvent(lv_event_t *e)
     const auto now = (unsigned long long)esp_timer_get_time();
     ManualPress::Action action{ManualPress::None, 0};
     if (code == LV_EVENT_PRESSED) {
-        setVehicleFNR(cmd);
-        if (s_cruise_active.exchange(false)) s_pending_cmd = CMD_STOP;
         action = s_manual_press.begin((int)cmd, now);
     } else if (s_manual_press.direction == (int)cmd) {
         if (code == LV_EVENT_PRESSING) action = s_manual_press.update(now);
@@ -742,8 +1177,47 @@ static void canvas_fill_rect(lv_obj_t *canvas, int x, int y, int w, int h,
             lv_canvas_set_px(canvas, px, py, color, LV_OPA_COVER);
 }
 
+static void draw_tilt_level(lv_obj_t *canvas, float degrees, bool valid,
+                            bool vertical)
+{
+    if (!canvas) return;
+    const lv_color_t bg = lv_color_hex(0xF8FAF8);
+    const lv_color_t tube = lv_color_hex(0x667873);
+    const lv_color_t liquid = lv_color_hex(0xDCEFE8);
+    const lv_color_t bubble = lv_color_hex(valid ? 0xE9A23B : 0xAAB5B1);
+    lv_canvas_fill_bg(canvas, bg, LV_OPA_COVER);
+
+    auto disc = [&](int cx, int cy, int radius, lv_color_t color) {
+        for (int y = -radius; y <= radius; ++y)
+            for (int x = -radius; x <= radius; ++x)
+                if (x * x + y * y <= radius * radius)
+                    lv_canvas_set_px(canvas, cx + x, cy + y,
+                                     color, LV_OPA_COVER);
+    };
+
+    const float angle = valid ? std::clamp(degrees, -30.0f, 30.0f) : 0.0f;
+    if (vertical) {
+        /* Vehicle front is the top. Positive/forward pitch moves the bubble
+           toward the rear (bottom), opposite to the vehicle inclination. */
+        canvas_fill_rect(canvas, 41, 3, 25, 39, tube);
+        canvas_fill_rect(canvas, 45, 5, 17, 35, liquid);
+        canvas_fill_rect(canvas, 39, 21, 29, 2, tube);
+        const int bubble_y = 22 + (int)lroundf(angle * 12.0f / 30.0f);
+        disc(53, bubble_y, 7, bubble);
+    } else {
+        /* Bubble moves opposite roll: left tilt -> bubble to the right. */
+        canvas_fill_rect(canvas, 7, 10, 93, 25, tube);
+        canvas_fill_rect(canvas, 9, 14, 89, 17, liquid);
+        canvas_fill_rect(canvas, 52, 8, 2, 29, tube);
+        const int bubble_x = 53 - (int)lroundf(angle * 35.0f / 30.0f);
+        disc(bubble_x, 22, 7, bubble);
+    }
+    lv_obj_invalidate(canvas);
+}
+
+/* icon_type: 0=no canvas icon, 1=fuel, 2=spray liquid. */
 static void draw_analog_level_gauge(lv_obj_t *canvas, int percent,
-                                    bool fuel_icon)
+                                    int icon_type)
 {
     if (!canvas) return;
     const lv_color_t bg = lv_color_hex(0xF4F6F4);
@@ -793,14 +1267,14 @@ static void draw_analog_level_gauge(lv_obj_t *canvas, int percent,
          5, needle);
     disc(pivot_x, pivot_y, 8, needle);
 
-    if (fuel_icon) {
+    if (icon_type == 1) {
         canvas_fill_rect(canvas, 110, 54, 17, 25, ink);
         canvas_fill_rect(canvas, 113, 57, 11, 8, bg);
         canvas_fill_rect(canvas, 108, 78, 22, 3, ink);
         line(127, 58, 134, 62, 2, ink);
         line(134, 62, 134, 75, 2, ink);
         line(134, 75, 131, 77, 2, ink);
-    } else {
+    } else if (icon_type == 2) {
         /* Spray-liquid level: up/down arrows, waves and a level scale. */
         line(108, 61, 108, 49, 3, ink);
         line(108, 49, 103, 56, 3, ink);
@@ -1047,6 +1521,36 @@ static unsigned draw7Number(lv_obj_t *canvas, long n, unsigned xLoc,
     return d * (unsigned)abs(nD);
 }
 
+static void set_tilt_label(lv_obj_t *canvas, bool valid, float degrees)
+{
+    if (!canvas) return;
+    const lv_color_t bg = lv_color_hex(0xF8FAF8);
+    const lv_color_t fg = lv_color_hex(0x20302C);
+    lv_canvas_fill_bg(canvas, bg, LV_OPA_COVER);
+    constexpr unsigned cs = 1;
+    constexpr unsigned y = 1;
+
+    if (!valid || !isfinite(degrees)) {
+        draw7Number(canvas, 0, 29, y, cs, fg, bg, 1, 1);
+        draw7Number(canvas, 0, 45, y, cs, fg, bg, 1, 1);
+    } else {
+        const int rounded = std::clamp((int)lroundf(degrees), -99, 99);
+        const unsigned magnitude = (unsigned)abs(rounded);
+        if (rounded < 0)
+            draw7Number(canvas, 0, 21, y, cs, fg, bg, 1, 1);
+        if (magnitude >= 10)
+            draw7Number(canvas, magnitude / 10, 37, y, cs, fg, bg, 1, 0);
+        draw7Number(canvas, magnitude % 10, 53, y, cs, fg, bg, 1, 0);
+
+        /* Small seven-segment-style degree mark. */
+        for (int py = 2; py <= 7; ++py)
+            for (int px = 72; px <= 77; ++px)
+                if (py == 2 || py == 7 || px == 72 || px == 77)
+                    lv_canvas_set_px(canvas, px, py, fg, LV_OPA_COVER);
+    }
+    lv_obj_invalidate(canvas);
+}
+
 static void draw_speed_7segment(lv_obj_t *canvas, int speed_tenths, bool valid)
 {
     if (!canvas) return;
@@ -1054,7 +1558,8 @@ static void draw_speed_7segment(lv_obj_t *canvas, int speed_tenths, bool valid)
     const lv_color_t fg = lv_color_hex(0x20302C);
     lv_canvas_fill_bg(canvas, bg, LV_OPA_COVER);
     constexpr unsigned cs = 3;
-    constexpr unsigned startX = 5;
+    /* Three-digit group is centered in the full 229 px speed card. */
+    constexpr unsigned startX = 59;
     constexpr unsigned y = 8;
     const unsigned digitWidth = 5 * cs + 3 * (2 * cs) + 2 + cs;
     if (!valid) {
@@ -1105,17 +1610,42 @@ static void draw_distance_7segment(lv_obj_t *canvas, uint32_t distance_tenths)
 
 bool AS500UI::setVehicleFNR(control_cmd_t direction)
 {
-    if (direction != CMD_FORWARD && direction != CMD_REVERSE &&
-        direction != CMD_LEFT && direction != CMD_RIGHT) return false;
-    if (s_vehicle_fnr.exchange(direction) != direction &&
-        s_cruise_active.exchange(false)) s_pending_cmd = CMD_STOP;
+    if (direction != CMD_NONE && direction != CMD_FORWARD &&
+        direction != CMD_REVERSE) return false;
+    const control_cmd_t previous = s_vehicle_fnr.exchange(direction);
+    if (previous != direction && cruisePressed()) {
+        s_pending_cmd = direction == CMD_FORWARD || direction == CMD_REVERSE
+            ? direction : CMD_STOP;
+    }
     return true;
 }
 
 void AS500UI::cruiseButtonEvent(lv_event_t *e)
 {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    toggleCruise();
+    const lv_event_code_t code = lv_event_get_code(e);
+    const bool was_pressed = cruisePressed();
+    if (code == LV_EVENT_PRESSED) s_touch_cruise_pressed = true;
+    else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST)
+        s_touch_cruise_pressed = false;
+    else return;
+    const control_cmd_t command = cruise_transition_command(
+        was_pressed, cruisePressed(), s_vehicle_fnr.load());
+    if (command != CMD_NONE) s_pending_cmd = command;
+}
+
+void AS500UI::setInterfaceCruisePressed(bool pressed)
+{
+    const bool was_pressed = cruisePressed();
+    s_interface_cruise_pressed = pressed;
+    const control_cmd_t command = cruise_transition_command(
+        was_pressed, cruisePressed(), s_vehicle_fnr.load());
+    if (command != CMD_NONE) s_pending_cmd = command;
+}
+
+bool AS500UI::cruisePressed()
+{
+    return s_touch_cruise_pressed.load() ||
+           s_interface_cruise_pressed.load();
 }
 
 void AS500UI::currentGaugeEvent(lv_event_t *e)
@@ -1139,18 +1669,329 @@ void AS500UI::tripResetEvent(lv_event_t *e)
     draw_distance_7segment(ui->m_dash_trip, 0);
 }
 
-void AS500UI::toggleCruise()
+void AS500UI::tiltZeroEvent(lv_event_t *e)
 {
-    if (s_cruise_active.exchange(false)) {
-        s_pending_cmd = CMD_STOP;
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
+    if (!s_tilt_settings_overlay) return;
+    s_tilt_value_on_open[0] = s_as48_value[1];
+    s_tilt_value_on_open[1] = s_as48_value[2];
+    s_tilt_value_on_open[2] = s_as48_value[3];
+    tilt_settings_refresh();
+    lv_obj_clear_flag(s_tilt_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_tilt_settings_overlay);
+}
+
+void AS500UI::tiltSettingsEvent(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    AS500UI *ui = s_ui_instance;
+    const int action = (int)(intptr_t)lv_event_get_user_data(e);
+    if (action == 31) {
+        s_as48_value[2] = s_as48_value[1];
+        as48_save_all();
+        lv_obj_add_flag(s_tilt_settings_overlay, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    const control_cmd_t direction = s_vehicle_fnr.load();
-    if (direction == CMD_FORWARD || direction == CMD_REVERSE ||
-        direction == CMD_LEFT || direction == CMD_RIGHT) {
-        s_cruise_active = true;
-        s_pending_cmd = direction;
+    if (action == 32) {
+        s_as48_value[1] = s_tilt_value_on_open[0];
+        s_as48_value[2] = s_tilt_value_on_open[1];
+        s_as48_value[3] = s_tilt_value_on_open[2];
+        tilt_settings_refresh();
+        lv_obj_add_flag(s_tilt_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+        return;
     }
+    if (action != 30 || !ui || !ui->m_dash_imu_valid) return;
+
+    /* Displayed angle = raw angle + saved offset. Subtracting the current
+       displayed angle therefore stores the exact offset that makes it zero. */
+    s_as48_value[4] = std::clamp(s_as48_value[4] - ui->m_dash_pitch_deg,
+                                 s_as48_min[4], s_as48_max[4]);
+    s_as48_value[5] = std::clamp(s_as48_value[5] - ui->m_dash_roll_deg,
+                                 s_as48_min[5], s_as48_max[5]);
+    /* Persist the zero offsets immediately without committing alarm edits
+       that have not yet been accepted with Save and Exit. */
+    const float pending_angle = s_as48_value[1];
+    const float pending_legacy_angle = s_as48_value[2];
+    const float pending_enabled = s_as48_value[3];
+    s_as48_value[1] = s_tilt_value_on_open[0];
+    s_as48_value[2] = s_tilt_value_on_open[1];
+    s_as48_value[3] = s_tilt_value_on_open[2];
+    as48_save_all();
+    s_as48_value[1] = pending_angle;
+    s_as48_value[2] = pending_legacy_angle;
+    s_as48_value[3] = pending_enabled;
+    ui->m_dash_pitch_deg = 0.0f;
+    ui->m_dash_roll_deg = 0.0f;
+    set_tilt_label(ui->m_dash_pitch, true, 0.0f);
+    set_tilt_label(ui->m_dash_roll, true, 0.0f);
+    draw_tilt_level(ui->m_dash_pitch_level, 0.0f, true, true);
+    draw_tilt_level(ui->m_dash_roll_level, 0.0f, true, false);
+    ESP_LOGI("AS500UI", "IMU zero saved: pitch_offset=%.1f roll_offset=%.1f",
+             (double)s_as48_value[4], (double)s_as48_value[5]);
+}
+
+void AS500UI::tiltSettingRowEvent(lv_event_t *e)
+{
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_CLICKED && code != LV_EVENT_LONG_PRESSED_REPEAT)
+        return;
+    const int index = (int)(intptr_t)lv_event_get_user_data(e);
+    if (index != 1 && index != 3) return;
+    lv_indev_t *indev = lv_event_get_indev(e);
+    if (!indev) return;
+    lv_point_t point;
+    lv_area_t area;
+    lv_indev_get_point(indev, &point);
+    lv_obj_get_coords(lv_event_get_target_obj(e), &area);
+    const int x = point.x - area.x1;
+    if (x >= 772 && x < 852) {
+        if (index == 3) s_as48_value[index] = 0.0f;
+        else s_as48_value[index] = fmaxf(s_as48_min[index],
+            s_as48_value[index] - s_as48_step[index]);
+    } else if (x >= 866 && x < 946) {
+        if (index == 3) s_as48_value[index] = 1.0f;
+        else s_as48_value[index] = fminf(s_as48_max[index],
+            s_as48_value[index] + s_as48_step[index]);
+    } else {
+        return;
+    }
+    s_as48_value[2] = s_as48_value[1];
+    tilt_settings_refresh();
+}
+
+void AS500UI::refreshAnalogSettings()
+{
+    char text[24];
+    for (int channel = 0; channel < kAnalogChannelCount; ++channel) {
+        snprintf(text, sizeof(text), "%03u", m_analog_raw[channel]);
+        update_analog_text_canvas(m_analog_raw_values[channel], text);
+        snprintf(text, sizeof(text), "%03u / 255",
+                 calibratedAnalogValue(channel, m_analog_raw[channel]));
+        update_analog_text_canvas(m_analog_calibrated_values[channel], text);
+        snprintf(text, sizeof(text), "%u", s_analog_calibration[channel][0]);
+        update_analog_text_canvas(m_analog_setting_values[channel * 2], text);
+        snprintf(text, sizeof(text), "%u", s_analog_calibration[channel][1]);
+        update_analog_text_canvas(m_analog_setting_values[channel * 2 + 1],
+                                  text);
+    }
+}
+
+bool AS500UI::openAnalogSettings()
+{
+    if (s_vehicle_fnr.load() != CMD_NONE) {
+        ESP_LOGW("AS500UI", "ADC calibration blocked: FNR is not neutral");
+        return false;
+    }
+    AS500UI *ui = s_ui_instance;
+    if (!ui) {
+        ESP_LOGE("AS500UI", "ADC calibration unavailable: settings overlay missing");
+        return false;
+    }
+    if (!ui->m_analog_settings) {
+        ESP_LOGI("AS500UI", "ADC calibration overlay creation requested");
+        ui->createAnalogSettingsOverlay(lv_scr_act());
+    }
+    if (!ui->m_analog_settings) {
+        ESP_LOGE("AS500UI", "ADC calibration unavailable: overlay creation failed");
+        return false;
+    }
+    update_analog_text_canvas(ui->m_analog_status, "");
+    memcpy(s_analog_calibration_on_open, s_analog_calibration,
+           sizeof(s_analog_calibration));
+    ui->refreshAnalogSettings();
+    lv_obj_clear_flag(ui->m_analog_settings, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(ui->m_analog_settings);
+    ESP_LOGI("AS500UI", "ADC calibration menu opened");
+    return true;
+}
+
+void AS500UI::analogSettingsTouchEvent(lv_event_t *e)
+{
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        if (s_analog_settings_long_press_timer) {
+            lv_timer_delete(s_analog_settings_long_press_timer);
+            s_analog_settings_long_press_timer = nullptr;
+        }
+        s_analog_settings_long_press_timer =
+            lv_timer_create(analogSettingsLongPressTimer, 3000, nullptr);
+        if (!s_analog_settings_long_press_timer) {
+            ESP_LOGE("AS500UI", "Failed to create speed-limit settings timer");
+        } else {
+            lv_timer_set_repeat_count(s_analog_settings_long_press_timer, 1);
+        }
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        if (s_analog_settings_long_press_timer) {
+            lv_timer_delete(s_analog_settings_long_press_timer);
+            s_analog_settings_long_press_timer = nullptr;
+        }
+    }
+}
+
+void AS500UI::analogSettingsLongPressTimer(lv_timer_t *timer)
+{
+    if (timer != s_analog_settings_long_press_timer) return;
+    s_analog_settings_long_press_timer = nullptr;
+    openAnalogSettings();
+}
+
+void AS500UI::analogSettingsEvent(lv_event_t *e)
+{
+    const lv_event_code_t code = lv_event_get_code(e);
+    AS500UI *ui = static_cast<AS500UI *>(lv_event_get_user_data(e));
+    if (!ui) return;
+    if (code != LV_EVENT_CLICKED) return;
+
+    const int action = (int)(intptr_t)lv_obj_get_user_data(
+        lv_event_get_target_obj(e));
+    if (action == 1) {
+        if (!save_analog_calibration()) {
+            update_analog_text_canvas(ui->m_analog_status, "NVS SAVE FAILED");
+            return;
+        }
+        update_analog_text_canvas(ui->m_analog_status, "");
+        lv_obj_add_flag(ui->m_analog_settings, LV_OBJ_FLAG_HIDDEN);
+    } else if (action == 2) {
+        memcpy(s_analog_calibration, s_analog_calibration_on_open,
+               sizeof(s_analog_calibration));
+        lv_obj_add_flag(ui->m_analog_settings, LV_OBJ_FLAG_HIDDEN);
+    } else if (action == 3) {
+        for (int i = 0; i < kAnalogChannelCount; ++i) {
+            s_analog_calibration[i][0] = 0;
+            s_analog_calibration[i][1] = 255;
+        }
+        update_analog_text_canvas(ui->m_analog_status, "");
+        ui->refreshAnalogSettings();
+    }
+}
+
+void AS500UI::analogSettingAdjustEvent(lv_event_t *e)
+{
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_CLICKED && code != LV_EVENT_LONG_PRESSED_REPEAT)
+        return;
+    AS500UI *ui = s_ui_instance;
+    const int action = (int)(intptr_t)lv_event_get_user_data(e) - 100;
+    if (!ui || action < 0 || action >= kAnalogChannelCount * 4) return;
+    const int channel = action / 4;
+    const int part = (action % 4) / 2; /* 0=OFFSET, 1=MAX */
+    const int delta = (action & 1) ? 1 : -1;
+    int value = (int)s_analog_calibration[channel][part] + delta;
+    if (part == 0)
+        value = std::clamp(value, 0,
+                           (int)s_analog_calibration[channel][1] - 1);
+    else
+        value = std::clamp(value,
+                           (int)s_analog_calibration[channel][0] + 1, 255);
+    s_analog_calibration[channel][part] = (uint8_t)value;
+    update_analog_text_canvas(ui->m_analog_status, "");
+    ui->refreshAnalogSettings();
+}
+
+void AS500UI::createAnalogSettingsOverlay(lv_obj_t *screen)
+{
+    lv_mem_monitor_t mem;
+    lv_mem_monitor(&mem);
+    ESP_LOGI("AS500UI", "LVGL heap before analog overlay: free=%lu largest=%lu used=%u%%",
+             (unsigned long)mem.free_size,
+             (unsigned long)mem.free_biggest_size, (unsigned)mem.used_pct);
+
+    m_analog_settings = lv_obj_create(screen);
+    lv_obj_set_pos(m_analog_settings, 0, 0);
+    lv_obj_set_size(m_analog_settings, 1024, 600);
+    lv_obj_set_style_bg_color(m_analog_settings, lv_color_hex(0x111A18), 0);
+    lv_obj_set_style_border_width(m_analog_settings, 0, 0);
+    lv_obj_set_style_pad_all(m_analog_settings, 24, 0);
+    lv_obj_clear_flag(m_analog_settings, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto make_button = [&](lv_obj_t *parent, const char *value,
+                           int x, int y, int w, int h, int text_x,
+                           int action, lv_event_cb_t callback) {
+        lv_obj_t *button = lv_obj_create(parent);
+        lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_pos(button, x, y);
+        lv_obj_set_size(button, w, h);
+        lv_obj_set_style_pad_all(button, 0, 0);
+        lv_obj_set_style_bg_color(button, lv_color_hex(0x263832), 0);
+        lv_obj_set_style_bg_color(
+            button, lv_color_hex(0x287A67),
+            LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(button, 1, 0);
+        lv_obj_set_style_border_color(button, lv_color_hex(0x40564D), 0);
+        lv_obj_set_style_radius(button, 8, 0);
+        lv_obj_set_user_data(button, (void *)(intptr_t)action);
+        lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED,
+                            callback == analogSettingsEvent ? this
+                                                            : (void *)(intptr_t)action);
+        if (callback == analogSettingAdjustEvent) {
+            lv_obj_add_event_cb(button, callback, LV_EVENT_LONG_PRESSED_REPEAT,
+                                (void *)(intptr_t)action);
+        }
+        create_analog_text_canvas(button, text_x, (h - 32) / 2,
+                                  w - text_x * 2, 32, value);
+        return button;
+    };
+
+    create_analog_text_canvas(m_analog_settings, 12, 0, 976, 36,
+                              "아날로그 입력 보정");
+    create_analog_text_canvas(m_analog_settings, 12, 78, 180, 32, "채널");
+    create_analog_text_canvas(m_analog_settings, 204, 78, 128, 32, "RAW");
+    create_analog_text_canvas(m_analog_settings, 344, 78, 188, 32, "OFFSET");
+    create_analog_text_canvas(m_analog_settings, 540, 78, 188, 32, "MAX");
+    create_analog_text_canvas(m_analog_settings, 736, 78, 228, 32, "적용");
+    ESP_LOGI("AS500UI", "Analog overlay header created");
+    static const char *channel_names[kAnalogChannelCount] = {
+        "스로틀 1", "스로틀 2", "속도제한", "VR 2"
+    };
+    for (int channel = 0; channel < kAnalogChannelCount; ++channel) {
+        const int y = 128 + channel * 88;
+        lv_obj_t *row = lv_obj_create(m_analog_settings);
+        lv_obj_set_pos(row, 0, y);
+        lv_obj_set_size(row, 976, 72);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x1A2823), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x304039), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        create_analog_text_canvas(row, 12, 20, 180, 32,
+                                  channel_names[channel]);
+        m_analog_raw_values[channel] = create_analog_text_canvas(
+            row, 204, 20, 128, 32, "000");
+        m_analog_calibrated_values[channel] = create_analog_text_canvas(
+            row, 736, 20, 228, 32, "000 / 255");
+        for (int part = 0; part < 2; ++part) {
+            const int x = part == 0 ? 344 : 540;
+            const int slot = channel * 2 + part;
+            make_button(row, "-", x + 4, 9, 38, 54, 3,
+                        100 + channel * 4 + part * 2,
+                        analogSettingAdjustEvent);
+            m_analog_setting_values[slot] = create_analog_text_canvas(
+                row, x + 46, 20, 96, 32, "0");
+            make_button(row, "+", x + 148, 9, 38, 54, 3,
+                        101 + channel * 4 + part * 2,
+                        analogSettingAdjustEvent);
+        }
+        lv_mem_monitor(&mem);
+        ESP_LOGI("AS500UI", "Analog overlay channel %d created: LVGL free=%lu largest=%lu",
+                         channel + 1, (unsigned long)mem.free_size,
+                         (unsigned long)mem.free_biggest_size);
+    }
+    m_analog_status = create_analog_text_canvas(
+        m_analog_settings, 12, 466, 952, 32, "");
+    make_button(m_analog_settings, "DEFAULT", 304, 500, 150, 60, 3,
+                3, analogSettingsEvent);
+    make_button(m_analog_settings, "CANCEL", 464, 500, 150, 60, 3,
+                2, analogSettingsEvent);
+    make_button(m_analog_settings, "SAVE", 624, 500, 150, 60, 3,
+                1, analogSettingsEvent);
+    refreshAnalogSettings();
+    lv_obj_add_flag(m_analog_settings, LV_OBJ_FLAG_HIDDEN);
+    lv_mem_monitor(&mem);
+    ESP_LOGI("AS500UI", "Analog overlay ready: LVGL free=%lu largest=%lu used=%u%%",
+             (unsigned long)mem.free_size,
+             (unsigned long)mem.free_biggest_size, (unsigned)mem.used_pct);
 }
 
 void AS500UI::vehicleDrawEvent(lv_event_t *e)
@@ -1451,43 +2292,45 @@ bool AS500UI::touchPoints(const uint16_t *x, const uint16_t *y, uint8_t count)
         lv_obj_get_coords(obj, &area);
         return px >= area.x1 && px <= area.x2 && py >= area.y1 && py <= area.y2;
     };
-    unsigned keys = 0;
     bool stop = false, estop = false, cruise = false;
-    const bool overlay = s_settings_overlay &&
+    if (count && !s_physical_touch_down) {
+        s_physical_touch_down = true;
+        ESP_LOGI("AS500UI", "TOUCH DOWN count=%u x=%u y=%u",
+                 (unsigned)count, (unsigned)x[0], (unsigned)y[0]);
+    } else if (!count && s_physical_touch_down) {
+        s_physical_touch_down = false;
+        ESP_LOGI("AS500UI", "TOUCH UP");
+    }
+    const bool vehicle_settings_open = s_settings_overlay &&
         !lv_obj_has_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    const bool row_settings_open = s_row_settings_overlay &&
+        !lv_obj_has_flag(s_row_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    const bool analog_settings_open = s_ui_instance &&
+        s_ui_instance->m_analog_settings &&
+        !lv_obj_has_flag(s_ui_instance->m_analog_settings,
+                         LV_OBJ_FLAG_HIDDEN);
+    const bool tilt_settings_open = s_tilt_settings_overlay &&
+        !lv_obj_has_flag(s_tilt_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    const bool overlay = vehicle_settings_open || row_settings_open ||
+                         analog_settings_open ||
+                         tilt_settings_open;
     if (!count) s_touch_release_required = false;
     for (unsigned i = 0; i < count && !overlay; ++i) {
-        for (unsigned k = 0; k < 6; ++k)
-            if (hit(s_direction_buttons[k], x[i], y[i])) keys |= 1u << k;
         stop |= hit(s_touch_stop, x[i], y[i]);
         estop |= hit(s_touch_estop, x[i], y[i]);
         cruise |= hit(s_touch_cruise, x[i], y[i]);
     }
-    const bool consumed = keys || s_touch_keys || stop || estop || cruise ||
-                          s_touch_cruise_pressed || s_touch_release_required;
-    if (cruise && !s_touch_cruise_pressed) toggleCruise();
+    const bool consumed = stop || estop || cruise ||
+                          s_touch_cruise_pressed.load() ||
+                          s_touch_release_required;
+    const bool cruise_was_pressed = cruisePressed();
     s_touch_cruise_pressed = cruise;
+    const control_cmd_t cruise_command = cruise_transition_command(
+        cruise_was_pressed, cruisePressed(), s_vehicle_fnr.load());
+    if (cruise_command != CMD_NONE) s_pending_cmd = cruise_command;
     if (stop || estop) {
         s_touch_release_required = true;
         s_pending_cmd = estop ? CMD_ESTOP : CMD_STOP;
-    }
-    if (s_touch_release_required || overlay) keys = 0;
-    if (keys != s_touch_keys && !stop && !estop) {
-        const unsigned pressed = keys & ~s_touch_keys;
-        const unsigned released = s_touch_keys & ~keys;
-        if (pressed & 1u) s_pending_cmd = CMD_HAZARD_TOGGLE;
-        else if (pressed & 2u) s_pending_cmd = CMD_HORN_ON;
-        else if (pressed & 4u) s_pending_cmd = CMD_PUMP_TOGGLE;
-        else if (pressed & 8u) s_pending_cmd = CMD_BLOWER_TOGGLE;
-        else if (pressed & 16u) s_pending_cmd = CMD_HEADLIGHT_TOGGLE;
-        else if (pressed & 32u) s_pending_cmd = CMD_PARKING_LIGHT_TOGGLE;
-        else if (released & 2u) s_pending_cmd = CMD_HORN_OFF;
-    }
-    s_touch_keys = keys;
-    for (unsigned k = 0; k < 6; ++k) {
-        if (!s_direction_buttons[k]) continue;
-        if (keys & (1u << k)) lv_obj_add_state(s_direction_buttons[k], LV_STATE_PRESSED);
-        else lv_obj_remove_state(s_direction_buttons[k], LV_STATE_PRESSED);
     }
     return consumed;
 }
@@ -1797,6 +2640,7 @@ void AS500UI::init(bool can_ok)
 {
     s_ui_instance = this;
     loadSettings();
+    load_analog_calibration();
     nvs_handle_t vacuum_nvs;
     if (nvs_open("sweeper_cfg", NVS_READWRITE, &vacuum_nvs) == ESP_OK) {
         uint8_t power = 80;
@@ -2189,7 +3033,7 @@ void AS500UI::init(bool can_ok)
         label(m_drive_card, "R", 228, 108, 18, 30,
               &lv_font_montserrat_24, 0xC9D1D9, LV_TEXT_ALIGN_RIGHT);
 
-        /* Actual motor RPM feedback from CAN 0x5B8. Numeric columns use the
+        /* Motor RPM feedback is unavailable in CAN 0x5A0. Numeric columns use the
            same x coordinates as the L/R percentage row above. */
         /* A single fixed-width row saves six LVGL objects and leaves enough
            internal RAM for LVGL's glyph draw buffer. */
@@ -2218,6 +3062,7 @@ void AS500UI::init(bool can_ok)
 
         /* Settings overlay: 20 items in two columns, as ui_seting.json. */
         s_settings_overlay = box(scr, 0, 0, 1024, 600, 0x0F172A, 0x0F172A);
+        s_row_settings_overlay = s_settings_overlay;
         lv_obj_t *title_panel = box(s_settings_overlay, 8, 8, 408, 84,
                                     0x1E293B, 0x1E293B, 10);
         lv_obj_set_style_border_width(title_panel, 0, 0);
@@ -2389,12 +3234,11 @@ void AS500UI::init(bool can_ok)
                        861, 93, 163, 28, &lv_font_montserrat_18,
                        can_ok ? 0x9ED5B8 : 0xF2A7A0, LV_TEXT_ALIGN_LEFT);
           lv_label_set_long_mode(m_dash_can, LV_LABEL_LONG_CLIP);
-          /* FNR is a selector, independent of actual motion. For now the
-             direction keys select it; a future external switch can call
-             setVehicleFNR() without changing the Cruise implementation. */
+          /* Physical FNR selector received from AS500-interface over 0x501. */
           lv_obj_t *fnr_box = box(header, 723, 12, 125, 75,
                                   0xFFFFFF, 0x64748B, 4);
-          label(fnr_box, "FNR", 6, 3, 113, 20,
+          m_dash_fnr_box = fnr_box;
+          m_dash_fnr_title = label(fnr_box, "FNR", 6, 3, 113, 20,
                 &lv_font_montserrat_16, 0x20302C, LV_TEXT_ALIGN_CENTER);
           m_dash_fnr = lv_canvas_create(fnr_box);
           lv_obj_set_pos(m_dash_fnr, 0, 29);
@@ -2414,7 +3258,7 @@ void AS500UI::init(bool can_ok)
           lv_obj_set_style_border_width(m_dash_cruise, 2, 0);
           lv_obj_add_flag(m_dash_cruise, LV_OBJ_FLAG_CLICKABLE);
           lv_obj_add_event_cb(m_dash_cruise, cruiseButtonEvent,
-                              LV_EVENT_CLICKED, nullptr);
+                              LV_EVENT_ALL, nullptr);
           m_dash_cruise_label = lv_canvas_create(m_dash_cruise);
           lv_obj_set_pos(m_dash_cruise_label, 2, 19);
           lv_obj_set_size(m_dash_cruise_label, 117, 40);
@@ -2439,7 +3283,6 @@ void AS500UI::init(bool can_ok)
                                    0x314A45, 0x58736B, 5);
             lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
-            register_touch_button(button, command);
             m_aux_buttons[aux_index] = button;
             if (command == CMD_REVERSE) {
               lv_obj_t *horn = lv_canvas_create(button);
@@ -2473,11 +3316,37 @@ void AS500UI::init(bool can_ok)
                               caption, 2, false);
             }
             m_aux_labels[aux_index++] = text;
+
+            /* Keep artwork from becoming the hit target. Route input through
+               a single topmost surface so the command event always fires. */
+            lv_obj_t *touch = lv_obj_create(button);
+            lv_obj_set_pos(touch, 0, 0);
+            lv_obj_set_size(touch, 124, 136);
+            lv_obj_set_style_bg_opa(touch, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(touch, 0, 0);
+            lv_obj_set_style_pad_all(touch, 0, 0);
+            lv_obj_clear_flag(touch, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(touch, LV_OBJ_FLAG_CLICKABLE);
+            if (command == CMD_HORN_ON) {
+              lv_obj_add_event_cb(touch, auxiliaryButtonEvent,
+                                  LV_EVENT_PRESSED,
+                                  (void *)(uintptr_t)command);
+              lv_obj_add_event_cb(touch, auxiliaryButtonEvent,
+                                  LV_EVENT_RELEASED,
+                                  (void *)(uintptr_t)command);
+              lv_obj_add_event_cb(touch, auxiliaryButtonEvent,
+                                  LV_EVENT_PRESS_LOST,
+                                  (void *)(uintptr_t)command);
+            } else {
+              lv_obj_add_event_cb(touch, auxiliaryButtonEvent,
+                                  LV_EVENT_CLICKED,
+                                  (void *)(uintptr_t)command);
+            }
           };
-          direction_button(12, 14, LV_SYMBOL_WARNING, "비상등", CMD_FORWARD);
-          direction_button(152, 14, LV_SYMBOL_AUDIO, "경적", CMD_REVERSE);
-          direction_button(12, 156, LV_SYMBOL_TINT, "펌프", CMD_LEFT);
-          direction_button(152, 156, LV_SYMBOL_REFRESH, "송풍", CMD_RIGHT);
+          direction_button(12, 14, LV_SYMBOL_WARNING, "비상등", CMD_HAZARD_TOGGLE);
+          direction_button(152, 14, LV_SYMBOL_AUDIO, "경적", CMD_HORN_ON);
+          direction_button(12, 156, LV_SYMBOL_TINT, "펌프", CMD_PUMP_TOGGLE);
+          direction_button(152, 156, LV_SYMBOL_REFRESH, "송풍", CMD_BLOWER_TOGGLE);
           direction_button(12, 298, LV_SYMBOL_EYE_OPEN, "전조등", CMD_HEADLIGHT_TOGGLE);
           direction_button(152, 298, LV_SYMBOL_EYE_CLOSE, "미등", CMD_PARKING_LIGHT_TOGGLE);
           ESP_LOGI("AS500UI", "AS500 direction ready");
@@ -2485,19 +3354,19 @@ void AS500UI::init(bool can_ok)
           lv_obj_t *speed = box(m_sprayer_dashboard, 320, 136, 229, 186,
                         0xFFFFFF, 0xD6DDD8, 6);
           m_dash_speed = lv_canvas_create(speed);
-          lv_obj_set_pos(m_dash_speed, 6, 8);
-          lv_obj_set_size(m_dash_speed, 155, 72);
-          void *speed_buf = heap_caps_calloc(155 * 72, 4, MALLOC_CAP_SPIRAM);
+          lv_obj_set_pos(m_dash_speed, 0, 8);
+          lv_obj_set_size(m_dash_speed, 229, 72);
+          void *speed_buf = heap_caps_calloc(229 * 72, 4, MALLOC_CAP_SPIRAM);
           if (speed_buf) {
-            lv_canvas_set_buffer(m_dash_speed, speed_buf, 155, 72,
+            lv_canvas_set_buffer(m_dash_speed, speed_buf, 229, 72,
                                  LV_COLOR_FORMAT_ARGB8888);
             draw_speed_7segment(m_dash_speed, 0, false);
           } else {
             lv_obj_add_flag(m_dash_speed, LV_OBJ_FLAG_HIDDEN);
             m_dash_speed = nullptr;
           }
-          label(speed, "km/h", 160, 48, 64, 24,
-              &lv_font_montserrat_16, 0x71807B, LV_TEXT_ALIGN_LEFT);
+          label(speed, "km/h", 145, 73, 72, 18,
+              &lv_font_montserrat_16, 0x71807B, LV_TEXT_ALIGN_RIGHT);
           auto distance_row = [&](int y, const char *name, lv_obj_t **canvas,
                                   bool clearable) {
             lv_obj_t *row = box(speed, 4, y, 221, 46, 0xFFFFFF, 0xE2E7E4, 2);
@@ -2524,11 +3393,31 @@ void AS500UI::init(bool can_ok)
               lv_obj_add_event_cb(row, tripResetEvent, LV_EVENT_CLICKED, this);
             }
           };
-          distance_row(88, "ODO", &m_dash_odometer, false);
-          distance_row(136, "TRIP", &m_dash_trip, true);
+          distance_row(92, "ODO", &m_dash_odometer, false);
+          distance_row(140, "TRIP", &m_dash_trip, true);
           ESP_LOGI("AS500UI", "AS500 speed ready");
 
-          auto level_gauge = [&](int x, bool fuel_icon, lv_obj_t **gauge) {
+          auto korean_gauge_title = [&](lv_obj_t *panel, const char *text) {
+            lv_obj_t *title_canvas = lv_canvas_create(panel);
+            lv_obj_set_pos(title_canvas, 8, 0);
+            lv_obj_set_size(title_canvas, 151, 24);
+            void *title_buf = heap_caps_calloc(151 * 24, 4,
+                                               MALLOC_CAP_SPIRAM);
+            if (!title_buf) {
+              lv_obj_delete(title_canvas);
+              return;
+            }
+            lv_canvas_set_buffer(title_canvas, title_buf, 151, 24,
+                                 LV_COLOR_FORMAT_ARGB8888);
+            const lv_color_t bg = lv_color_hex(0xF4F6F4);
+            lv_canvas_fill_bg(title_canvas, bg, LV_OPA_TRANSP);
+            const int title_width = ycb_hangul_measure(text, 1);
+            ycb_hangul_draw(title_canvas, std::max(0, 151 - title_width), 4,
+                            lv_color_hex(0x52635E), bg, text, 1, true);
+          };
+
+          auto level_gauge = [&](int x, int icon_type, const char *title,
+                                 lv_obj_t **gauge, lv_obj_t **value) {
             lv_obj_t *panel = box(m_sprayer_dashboard, x, 326, 167, 126,
                                   0xF4F6F4, 0xD6DDD8, 0);
             *gauge = lv_canvas_create(panel);
@@ -2539,40 +3428,103 @@ void AS500UI::init(bool can_ok)
             if (gauge_buf) {
               lv_canvas_set_buffer(*gauge, gauge_buf, 167, 126,
                                    LV_COLOR_FORMAT_ARGB8888);
-              draw_analog_level_gauge(*gauge, -1, fuel_icon);
+              draw_analog_level_gauge(*gauge, -1, icon_type);
             } else {
               lv_obj_delete(*gauge);
               *gauge = nullptr;
             }
-            label(panel, "F", 78, 4, 28, 34,
-                  &lv_font_montserrat_28, 0x29312F, LV_TEXT_ALIGN_CENTER);
-            label(panel, "E", 78, 90, 28, 34,
-                  &lv_font_montserrat_28, 0x29312F, LV_TEXT_ALIGN_CENTER);
+            korean_gauge_title(panel, title);
+            if (icon_type == 0) {
+              *value = label(panel, "--%", 105, 48, 54, 38,
+                             &lv_font_montserrat_20, 0x20302C,
+                             LV_TEXT_ALIGN_CENTER);
+              lv_obj_set_style_border_width(*value, 2, 0);
+              lv_obj_set_style_border_color(*value,
+                                            lv_color_hex(0x52635E), 0);
+              lv_obj_set_style_radius(*value, 2, 0);
+              lv_obj_set_style_pad_top(*value, 7, 0);
+            } else {
+              *value = label(panel, "--%", 103, 98, 56, 22,
+                             &lv_font_montserrat_14, 0x20302C,
+                             LV_TEXT_ALIGN_RIGHT);
+            }
+            return panel;
           };
-          level_gauge(666, false, &m_dash_spray_gauge);
-          level_gauge(837, true, &m_dash_fuel_gauge);
-          ESP_LOGI("AS500UI", "AS500 liquid gauges ready");
+          m_dash_speed_limit_tile = level_gauge(
+              324, 0, "속도제한", &m_dash_speed_limit_gauge,
+              &m_dash_speed_limit_value);
+          level_gauge(837, 2, "방제액", &m_dash_spray_gauge,
+                      &m_dash_spray_value);
+          if (m_dash_speed_limit_tile) {
+            /* The gauge canvas and value label cover the tile, so use one
+               transparent topmost hit surface for a reliable long press. */
+            lv_obj_t *analog_settings_touch = lv_obj_create(
+                m_dash_speed_limit_tile);
+            lv_obj_set_pos(analog_settings_touch, 0, 0);
+            lv_obj_set_size(analog_settings_touch, 167, 126);
+            lv_obj_set_style_bg_opa(analog_settings_touch, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(analog_settings_touch, 0, 0);
+            lv_obj_set_style_pad_all(analog_settings_touch, 0, 0);
+            lv_obj_clear_flag(analog_settings_touch, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(analog_settings_touch, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_border_width(analog_settings_touch, 0, 0);
+            lv_obj_set_style_border_color(
+                analog_settings_touch, lv_color_hex(0x5BC0DE),
+                LV_PART_MAIN | LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(
+                analog_settings_touch, 3, LV_PART_MAIN | LV_STATE_PRESSED);
+            lv_obj_add_event_cb(analog_settings_touch,
+                                analogSettingsTouchEvent,
+                                LV_EVENT_PRESSED, this);
+            lv_obj_add_event_cb(analog_settings_touch,
+                                analogSettingsTouchEvent,
+                                LV_EVENT_RELEASED, this);
+            lv_obj_add_event_cb(analog_settings_touch,
+                                analogSettingsTouchEvent,
+                                LV_EVENT_PRESS_LOST, this);
+          }
+          ESP_LOGI("AS500UI", "AS500 limit/liquid gauges ready");
 
           lv_obj_t *telemetry = box(m_sprayer_dashboard, 549, 136, 229, 186,
                             0xFFFFFF, 0xD6DDD8, 6);
           lv_obj_t *steering = box(telemetry, 0, 0, 229, 186,
                                    0xFFFFFF, 0xD6DDD8, 0);
-          m_dash_steering_gauge = lv_canvas_create(steering);
-          lv_obj_set_pos(m_dash_steering_gauge, 0, 0);
-          lv_obj_set_size(m_dash_steering_gauge, 229, 150);
-          void *steering_buf = heap_caps_calloc(229 * 150, 4, MALLOC_CAP_SPIRAM);
-          if (steering_buf) {
-            lv_canvas_set_buffer(m_dash_steering_gauge, steering_buf, 229, 150,
+          m_dash_rpm_gauge = lv_canvas_create(steering);
+          lv_obj_set_pos(m_dash_rpm_gauge, 0, 0);
+          lv_obj_set_size(m_dash_rpm_gauge, 229, 150);
+          void *rpm_buf = heap_caps_calloc(229 * 150, 4, MALLOC_CAP_SPIRAM);
+          if (rpm_buf) {
+            lv_canvas_set_buffer(m_dash_rpm_gauge, rpm_buf, 229, 150,
                                  LV_COLOR_FORMAT_ARGB8888);
-            draw_dashboard_dial(m_dash_steering_gauge, 229, 150, 0, -90, 90, true);
+            draw_dashboard_dial(m_dash_rpm_gauge, 229, 150, 0, 0, 5000, true);
           } else {
-            lv_obj_delete(m_dash_steering_gauge);
-            m_dash_steering_gauge = nullptr;
+            lv_obj_delete(m_dash_rpm_gauge);
+            m_dash_rpm_gauge = nullptr;
           }
-          label(steering, "-90", 4, 112, 54, 24,
+          label(steering, "RPM", 85, 5, 60, 22,
+                &lv_font_montserrat_14, 0x52635E, LV_TEXT_ALIGN_CENTER);
+          label(steering, "0", 4, 112, 54, 24,
                 &lv_font_montserrat_16, 0x29312F, LV_TEXT_ALIGN_CENTER);
-          label(steering, "+90", 171, 112, 54, 24,
+          label(steering, "5000", 167, 112, 58, 24,
                 &lv_font_montserrat_16, 0x29312F, LV_TEXT_ALIGN_CENTER);
+          m_dash_rpm_value = label(steering, "---- rpm", 69, 82, 92, 22,
+                                   &lv_font_montserrat_14, 0x29312F,
+                                   LV_TEXT_ALIGN_CENTER);
+          m_dash_parking_brake = lv_obj_create(steering);
+          lv_obj_set_pos(m_dash_parking_brake, 56, 140);
+          lv_obj_set_size(m_dash_parking_brake, 36, 36);
+          lv_obj_set_style_radius(m_dash_parking_brake, LV_RADIUS_CIRCLE, 0);
+          lv_obj_set_style_bg_opa(m_dash_parking_brake, LV_OPA_TRANSP, 0);
+          lv_obj_set_style_border_width(m_dash_parking_brake, 3, 0);
+          lv_obj_set_style_border_color(m_dash_parking_brake,
+                                        lv_color_hex(0x9AA6A1), 0);
+          lv_obj_set_style_pad_all(m_dash_parking_brake, 0, 0);
+          lv_obj_clear_flag(m_dash_parking_brake, LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_t *parking_p = lv_label_create(m_dash_parking_brake);
+          lv_label_set_text(parking_p, "P");
+          lv_obj_set_style_text_font(parking_p, &lv_font_montserrat_20, 0);
+          lv_obj_set_style_text_color(parking_p, lv_color_hex(0x9AA6A1), 0);
+          lv_obj_center(parking_p);
           lv_obj_t *temp_icon = lv_canvas_create(steering);
           lv_obj_set_pos(temp_icon, 129, 140);
           lv_obj_set_size(temp_icon, 32, 36);
@@ -2590,21 +3542,78 @@ void AS500UI::init(bool can_ok)
 
           lv_obj_t *incline = box(m_sprayer_dashboard, 778, 136, 230, 186,
                                   0xFFFFFF, 0xD6DDD8, 6);
-          auto incline_item = [&](int y, const char *name, lv_obj_t **value,
-                                  uint32_t accent) {
-            lv_obj_t *tile = box(incline, 0, y, 230, 93,
+          auto tilt_half = [&](int x, const char *name, lv_obj_t **value,
+                               lv_obj_t **level, bool vertical) {
+            lv_obj_t *tile = box(incline, x, 0, 115, 93,
                                  0xF8FAF8, 0xD6DDD8, 0);
-            label(tile, name, 12, 8, 72, 22, &lv_font_montserrat_14,
-                  0x52635E, LV_TEXT_ALIGN_LEFT);
-            box(tile, 12, 72, 206, 3, accent, accent, 1);
-            label(tile, "-     0     +", 12, 69, 206, 20,
-                  &lv_font_montserrat_12, 0x83918C, LV_TEXT_ALIGN_CENTER);
-            *value = label(tile, "--.-°", 92, 18, 120, 46,
-                           &lv_font_montserrat_28, 0x20302C,
-                           LV_TEXT_ALIGN_RIGHT);
+            label(tile, name, 8, 2, 99, 18, &lv_font_montserrat_12,
+                  0x52635E, LV_TEXT_ALIGN_CENTER);
+            *level = lv_canvas_create(tile);
+            lv_obj_set_pos(*level, 4, 19);
+            lv_obj_set_size(*level, 107, 45);
+            void *level_buf = heap_caps_calloc(107 * 45, 4,
+                                               MALLOC_CAP_SPIRAM);
+            if (level_buf) {
+              lv_canvas_set_buffer(*level, level_buf, 107, 45,
+                                   LV_COLOR_FORMAT_ARGB8888);
+              draw_tilt_level(*level, 0.0f, false, vertical);
+            } else {
+              lv_obj_delete(*level);
+              *level = nullptr;
+            }
+            *value = lv_canvas_create(tile);
+            lv_obj_set_pos(*value, 4, 68);
+            lv_obj_set_size(*value, 107, 21);
+            void *value_buf = heap_caps_calloc(107 * 21, 4,
+                                               MALLOC_CAP_SPIRAM);
+            if (value_buf) {
+              lv_canvas_set_buffer(*value, value_buf, 107, 21,
+                                   LV_COLOR_FORMAT_ARGB8888);
+              set_tilt_label(*value, false, 0.0f);
+            } else {
+              lv_obj_delete(*value);
+              *value = nullptr;
+            }
           };
-          incline_item(0, "PITCH", &m_dash_pitch, 0x4B83A6);
-          incline_item(93, "ROLL", &m_dash_roll, 0xD08A3C);
+          tilt_half(0, "PITCH", &m_dash_pitch, &m_dash_pitch_level, true);
+          tilt_half(115, "ROLL", &m_dash_roll, &m_dash_roll_level, false);
+          lv_obj_t *tilt_zero_button = lv_obj_create(incline);
+          lv_obj_set_pos(tilt_zero_button, 0, 0);
+          lv_obj_set_size(tilt_zero_button, 230, 93);
+          lv_obj_set_style_bg_opa(tilt_zero_button, LV_OPA_TRANSP, 0);
+          lv_obj_set_style_border_width(tilt_zero_button, 0, 0);
+          lv_obj_set_style_pad_all(tilt_zero_button, 0, 0);
+          lv_obj_clear_flag(tilt_zero_button, LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_add_flag(tilt_zero_button, LV_OBJ_FLAG_CLICKABLE);
+          lv_obj_add_event_cb(tilt_zero_button, tiltZeroEvent,
+                              LV_EVENT_LONG_PRESSED, this);
+
+          lv_obj_t *turn_signals = box(incline, 0, 93, 230, 93,
+                                       0xF4F6F4, 0xD6DDD8, 0);
+          m_dash_steering_gauge = lv_canvas_create(turn_signals);
+          lv_obj_set_pos(m_dash_steering_gauge, 0, 0);
+          lv_obj_set_size(m_dash_steering_gauge, 230, 93);
+          void *small_steering_buf = heap_caps_calloc(230 * 93, 4,
+                                                      MALLOC_CAP_SPIRAM);
+          if (small_steering_buf) {
+            lv_canvas_set_buffer(m_dash_steering_gauge, small_steering_buf,
+                                 230, 93, LV_COLOR_FORMAT_ARGB8888);
+            draw_dashboard_dial(m_dash_steering_gauge, 230, 93,
+                                0, -90, 90, false);
+          } else {
+            lv_obj_delete(m_dash_steering_gauge);
+            m_dash_steering_gauge = nullptr;
+          }
+          label(turn_signals, "STEERING", 55, 4, 120, 20,
+                &lv_font_montserrat_12, 0x52635E, LV_TEXT_ALIGN_CENTER);
+          m_dash_turn_left = label(turn_signals, LV_SYMBOL_LEFT,
+                                   5, 0, 48, 36,
+                                   &lv_font_montserrat_32, 0xAAB5B1,
+                                   LV_TEXT_ALIGN_CENTER);
+          m_dash_turn_right = label(turn_signals, LV_SYMBOL_RIGHT,
+                                    177, 0, 48, 36,
+                                    &lv_font_montserrat_32, 0xAAB5B1,
+                                    LV_TEXT_ALIGN_CENTER);
 
           auto meter = [&](int x, const char *title, const char *initial,
                            lv_obj_t **gauge, lv_obj_t **value) {
@@ -2622,36 +3631,27 @@ void AS500UI::init(bool can_ok)
               lv_obj_delete(*gauge);
               *gauge = nullptr;
             }
-            label(panel, title, 8, 6, 70, 22,
-                  &lv_font_montserrat_14, 0x52635E, LV_TEXT_ALIGN_LEFT);
+            korean_gauge_title(panel, title);
             *value = label(panel, initial, 61, 101, 96, 22,
                            &lv_font_montserrat_14, 0x20302C,
                            LV_TEXT_ALIGN_RIGHT);
           };
-          meter(324, "", "---%", &m_dash_battery_gauge,
-                &m_dash_battery_value);
+          meter(495, "배터리", "--%  --.-V", &m_dash_battery_gauge,
+                &m_dash_battery_voltage_value);
           lv_obj_t *battery_panel = m_dash_battery_gauge
               ? lv_obj_get_parent(m_dash_battery_gauge) : nullptr;
           if (battery_panel) {
-            lv_obj_set_pos(m_dash_battery_value, 20, 101);
-            lv_obj_set_size(m_dash_battery_value, 58, 22);
-            lv_obj_t *battery_title = lv_canvas_create(battery_panel);
-            lv_obj_set_pos(battery_title, 8, 5);
-            lv_obj_set_size(battery_title, 56, 22);
-            void *title_buf = heap_caps_calloc(56 * 22, 4, MALLOC_CAP_SPIRAM);
-            if (title_buf) {
-              lv_canvas_set_buffer(battery_title, title_buf, 56, 22,
-                                   LV_COLOR_FORMAT_ARGB8888);
-              lv_canvas_fill_bg(battery_title, lv_color_hex(0xF4F6F4),
-                                LV_OPA_COVER);
-              ycb_hangul_draw(battery_title, 0, 2, lv_color_hex(0x52635E),
-                              lv_color_hex(0xF4F6F4), "배터리", 1, true);
-            }
-            m_dash_battery_voltage_value = label(
-                battery_panel, "--.-V", 84, 101, 72, 22,
-                &lv_font_montserrat_14, 0x20302C, LV_TEXT_ALIGN_RIGHT);
+            m_dash_battery_value = nullptr;
+            label(battery_panel, "0", 4, 72, 30, 18,
+                  &lv_font_montserrat_12, 0x52635E, LV_TEXT_ALIGN_CENTER);
+            label(battery_panel, "100%", 123, 72, 40, 18,
+                  &lv_font_montserrat_12, 0x52635E, LV_TEXT_ALIGN_CENTER);
+            lv_obj_set_pos(m_dash_battery_voltage_value, 8, 101);
+            lv_obj_set_size(m_dash_battery_voltage_value, 151, 22);
+            lv_obj_set_style_text_align(m_dash_battery_voltage_value,
+                                        LV_TEXT_ALIGN_RIGHT, 0);
           }
-          meter(495, "CURRENT", "--.- A", &m_dash_current_gauge,
+          meter(666, "전류", "--.- A", &m_dash_current_gauge,
                 &m_dash_current_value);
           lv_obj_t *current_panel = m_dash_current_gauge
               ? lv_obj_get_parent(m_dash_current_gauge) : nullptr;
@@ -2659,9 +3659,9 @@ void AS500UI::init(bool can_ok)
             lv_obj_add_flag(current_panel, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_add_event_cb(current_panel, currentGaugeEvent,
                                 LV_EVENT_CLICKED, this);
-            m_dash_current_scale = label(current_panel, "MAX 100A", 91, 6, 68, 22,
+            m_dash_current_scale = label(current_panel, "MAX 100A", 8, 6, 76, 22,
                                          &lv_font_montserrat_12, 0x71807B,
-                                         LV_TEXT_ALIGN_RIGHT);
+                                         LV_TEXT_ALIGN_LEFT);
           }
           ESP_LOGI("AS500UI", "AS500 telemetry ready");
 
@@ -2690,8 +3690,30 @@ void AS500UI::init(bool can_ok)
             }
           };
           status_item(0, LV_SYMBOL_WARNING, "비상정지", &m_dash_brake);
+          m_dash_brake_tile = lv_obj_get_parent(m_dash_brake);
+          m_dash_brake_caption = m_dash_brake_tile
+              ? lv_obj_get_child(m_dash_brake_tile, 1) : nullptr;
           status_item(1, LV_SYMBOL_SHUFFLE, "경사", &m_dash_tilt);
+          m_dash_tilt_tile = lv_obj_get_parent(m_dash_tilt);
+          m_dash_tilt_caption = m_dash_tilt_tile
+              ? lv_obj_get_child(m_dash_tilt_tile, 1) : nullptr;
           status_item(2, LV_SYMBOL_LOOP, "엔진팬", &m_dash_ros);
+          m_dash_engine_fan_tile = lv_obj_get_parent(m_dash_ros);
+          m_dash_engine_fan_caption = m_dash_engine_fan_tile
+              ? lv_obj_get_child(m_dash_engine_fan_tile, 1) : nullptr;
+          if (m_dash_engine_fan_tile) {
+            lv_obj_add_flag(m_dash_engine_fan_tile, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_t *fan_touch = lv_obj_create(m_dash_engine_fan_tile);
+            lv_obj_set_pos(fan_touch, 0, 0);
+            lv_obj_set_size(fan_touch, 128, 104);
+            lv_obj_set_style_bg_opa(fan_touch, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(fan_touch, 0, 0);
+            lv_obj_set_style_pad_all(fan_touch, 0, 0);
+            lv_obj_clear_flag(fan_touch, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(fan_touch, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(fan_touch, buttonEvent, LV_EVENT_CLICKED,
+                                (void *)(uintptr_t)CMD_ENGINE_FAN_TOGGLE);
+          }
           status_item(3, LV_SYMBOL_AUDIO, "MP3", &m_dash_wireless);
           m_mp3_tile = lv_obj_get_parent(m_dash_wireless);
           lv_obj_add_flag(m_mp3_tile, LV_OBJ_FLAG_CLICKABLE);
@@ -2701,8 +3723,6 @@ void AS500UI::init(bool can_ok)
           lv_obj_t *settings = box(status_bar, 552, 8, 128, 104,
                            0x526D64, 0x526D64, 4);
           lv_obj_add_flag(settings, LV_OBJ_FLAG_CLICKABLE);
-          lv_obj_add_event_cb(settings, buttonEvent, LV_EVENT_CLICKED,
-                        (void *)(uintptr_t)CMD_SETTINGS);
           label(settings, LV_SYMBOL_SETTINGS, 40, 10, 48, 46,
               &lv_font_montserrat_32, 0xFFFFFF, LV_TEXT_ALIGN_CENTER);
           lv_obj_t *settings_caption = lv_canvas_create(settings);
@@ -2721,8 +3741,19 @@ void AS500UI::init(bool can_ok)
                             lv_color_white(), lv_color_hex(0x526D64),
                             settings_text, 2, false);
           }
+          lv_obj_t *settings_touch = lv_obj_create(settings);
+          lv_obj_set_pos(settings_touch, 0, 0);
+          lv_obj_set_size(settings_touch, 128, 104);
+          lv_obj_set_style_bg_opa(settings_touch, LV_OPA_TRANSP, 0);
+          lv_obj_set_style_border_width(settings_touch, 0, 0);
+          lv_obj_set_style_pad_all(settings_touch, 0, 0);
+          lv_obj_clear_flag(settings_touch, LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_add_flag(settings_touch, LV_OBJ_FLAG_CLICKABLE);
+          lv_obj_add_event_cb(settings_touch, buttonEvent, LV_EVENT_CLICKED,
+                              (void *)(uintptr_t)CMD_SETTINGS);
 
           create_as48_settings(scr);
+          createTiltSettingsOverlay(scr);
           lv_obj_move_foreground(m_sprayer_dashboard);
           ESP_LOGI("AS500UI", "AS500 dashboard ready");
 
@@ -3067,7 +4098,7 @@ void AS500UI::update(const robot_t &d)
     lv_color_t sc = stateColor(d.state);
 
     /* Match esp32_as_interface_v3_48V BatteryInfo_update(): sample the
-       0x5B8 voltage every 200 ms, apply EMA alpha=0.1, then map the nominal
+       0x5A0 voltage every 200 ms, apply EMA alpha=0.1, then map the nominal
        battery voltage from 85% (empty) to 105% (full). */
     const uint32_t battery_now_ms = lv_tick_get();
     if (!d.can_rx_ok || d.can_voltage_decivolts < 10u) {
@@ -3099,28 +4130,39 @@ void AS500UI::update(const robot_t &d)
     /* The AS500 dashboard is a standalone tree. Do not touch the uncreated
        legacy widgets when this layout is active. */
     if (m_sprayer_dashboard) {
-        if (d.can_emergency || d.gpio_emergency) s_cruise_active = false;
         const control_cmd_t fnr = s_vehicle_fnr.load();
         if (m_dash_fnr && fnr != m_dash_fnr_visual) {
             const char *text = fnr == CMD_FORWARD ? "전진" :
-                               fnr == CMD_REVERSE ? "후진" :
-                               fnr == CMD_LEFT ? "좌회전" :
-                               fnr == CMD_RIGHT ? "우회전" : "정지";
-            lv_canvas_fill_bg(m_dash_fnr, lv_color_hex(0xFFFFFF), LV_OPA_COVER);
+                               fnr == CMD_REVERSE ? "후진" : "정지";
+            const uint32_t bg = fnr == CMD_FORWARD ? 0x2E7D32 :
+                                fnr == CMD_REVERSE ? 0xC62828 : 0xFFFFFF;
+            const uint32_t fg = fnr == CMD_NONE ? 0x20302C : 0xFFFFFF;
+            if (m_dash_fnr_box) {
+                lv_obj_set_style_bg_color(m_dash_fnr_box,
+                                          lv_color_hex(bg), 0);
+                lv_obj_set_style_border_color(m_dash_fnr_box,
+                    lv_color_hex(fnr == CMD_NONE ? 0x64748B : bg), 0);
+            }
+            if (m_dash_fnr_title)
+                lv_obj_set_style_text_color(m_dash_fnr_title,
+                                            lv_color_hex(fg), 0);
+            lv_canvas_fill_bg(m_dash_fnr, lv_color_hex(bg), LV_OPA_COVER);
             const int width = ycb_hangul_measure(text, 2);
             ycb_hangul_draw(m_dash_fnr, (125 - width) / 2, 4,
-                            lv_color_hex(0x20302C), lv_color_hex(0xFFFFFF),
+                            lv_color_hex(fg), lv_color_hex(bg),
                             text, 2, false);
             lv_obj_invalidate(m_dash_fnr);
             m_dash_fnr_visual = fnr;
         }
-        const int8_t cruise = s_cruise_active.load() ? 1 : 0;
+        const bool cruise_pressed = cruisePressed();
+        const bool cruise_active = cruise_pressed;
+        const int8_t cruise = cruise_pressed ? 1 : 0;
         if (m_dash_cruise && cruise != m_dash_cruise_visual) {
+            const uint32_t bg = cruise_pressed ? 0xEC0909 : 0x526D64;
             lv_obj_set_style_bg_color(m_dash_cruise,
-                lv_color_hex(cruise ? 0xEC0909 : 0x526D64), 0);
+                lv_color_hex(bg), 0);
             if (m_dash_cruise_label) {
-                const uint32_t bg = cruise ? 0xEC0909 : 0x526D64;
-                const char *text = cruise ? "주행" : "정지";
+                const char *text = cruise_active ? "주행" : "정지";
                 lv_canvas_fill_bg(m_dash_cruise_label, lv_color_hex(bg),
                                   LV_OPA_COVER);
                 const int width = ycb_hangul_measure(text, 2);
@@ -3131,10 +4173,17 @@ void AS500UI::update(const robot_t &d)
             }
             m_dash_cruise_visual = cruise;
         }
+        const bool driver_status_valid = d.can_rx_ok && d.can_rx_age_ms <= 500;
+        const bool pump_response = driver_status_valid &&
+            (d.can_relay_status & AS500_RELAY_PUMP_MASK) != 0;
+        const bool blower_response = driver_status_valid &&
+            (d.can_relay_status & AS500_RELAY_BLOWER_MASK) != 0;
+        const bool engine_fan_response = driver_status_valid &&
+            (d.can_relay_status & AS500_RELAY_ENGINE_FAN_MASK) != 0;
         const uint8_t aux = (d.hazard_on ? 1u : 0u) |
                             (d.horn_on ? 2u : 0u) |
-                            (d.pump_on ? 4u : 0u) |
-                            (d.blower_on ? 8u : 0u) |
+                            (pump_response ? 4u : 0u) |
+                            (blower_response ? 8u : 0u) |
                             (d.headlight_on ? 16u : 0u) |
                             (d.parking_light_on ? 32u : 0u);
         if (aux != m_aux_visual) {
@@ -3157,22 +4206,45 @@ void AS500UI::update(const robot_t &d)
             }
             m_aux_visual = aux;
         }
+        const int8_t engine_fan_visual = engine_fan_response ? 1 : 0;
+        if (m_dash_engine_fan_tile && m_dash_ros &&
+            m_dash_engine_fan_visual != engine_fan_visual) {
+            const lv_color_t bg = lv_color_hex(
+                engine_fan_response ? 0xD64545 : 0xF7F9F7);
+            lv_obj_set_style_bg_color(m_dash_engine_fan_tile, bg, 0);
+            lv_obj_set_style_border_color(m_dash_engine_fan_tile,
+                lv_color_hex(engine_fan_response ? 0xA62F2F : 0xCED7D1), 0);
+            lv_obj_set_style_text_color(m_dash_ros,
+                lv_color_hex(engine_fan_response ? 0xFFFFFF : 0x83918C), 0);
+            if (m_dash_engine_fan_caption) {
+                lv_canvas_fill_bg(m_dash_engine_fan_caption, bg, LV_OPA_COVER);
+                const char *caption = "엔진팬";
+                const int caption_w = ycb_hangul_measure(caption, 2);
+                ycb_hangul_draw(m_dash_engine_fan_caption,
+                                (128 - caption_w) / 2, 4,
+                                lv_color_hex(engine_fan_response
+                                    ? 0xFFFFFF : 0x465650),
+                                bg, caption, 2, false);
+                lv_obj_invalidate(m_dash_engine_fan_caption);
+            }
+            m_dash_engine_fan_visual = engine_fan_visual;
+        }
         if (m_dash_can) {
             lv_label_set_text(m_dash_can, d.can_rx_ok ? "CAN  ONLINE" : "CAN  FAIL");
             lv_obj_set_style_text_color(m_dash_can,
                 lv_color_hex(d.can_rx_ok ? 0x9ED5B8 : 0xF2A7A0), 0);
         }
         if (m_dash_speed) {
-            if (d.can_rx_ok) {
-                /* Same 0x5B8 vehicle-speed conversion as
-                   esp32_as_interface_v3_48V: 250 mm wheel, 10:1 gearbox,
-                   default velocity correction K=0.5. */
+            if (d.can_motion_valid) {
+                /* Same calculation previously used by AS500-interface.  The
+                   P4 receives packed RPM directly from STM32 ID 0x5B8. */
                 const float avg_rpm =
                     (fabsf((float)d.can_motor1_rpm) +
                      fabsf((float)d.can_motor2_rpm)) * 0.5f;
                 float speed_kmh = avg_rpm * 3.14159265358979323846f * 0.25f /
-                                   10.0f * 60.0f / 1000.0f * 0.5f;
-                if (d.can_brake_applied) speed_kmh = 0.0f;
+                                   10.0f * 60.0f / 1000.0f *
+                                   as48SettingValue(13);
+                if (d.can_motion_brake_applied) speed_kmh = 0.0f;
                 const int speed_tenths = (int)lroundf(speed_kmh * 10.0f);
                 draw_speed_7segment(m_dash_speed, speed_tenths, true);
                 const uint32_t distance_now = lv_tick_get();
@@ -3194,30 +4266,57 @@ void AS500UI::update(const robot_t &d)
             (uint32_t)lround(m_dash_odometer_km * 10.0));
         draw_distance_7segment(m_dash_trip,
             (uint32_t)lround(m_dash_trip_km * 10.0));
-        const float steering_degrees = std::clamp(
-            ((float)d.can_command_right - (float)d.can_command_left) *
-                90.0f / 2000.0f,
-            -90.0f, 90.0f);
-        if (m_dash_steering_gauge)
-            draw_dashboard_dial(m_dash_steering_gauge, 229, 150,
-                                steering_degrees, -90, 90, true);
-        if (m_dash_battery_gauge)
-            draw_dashboard_dial(m_dash_battery_gauge, 167, 101,
-                                m_battery_filter_valid ? battery_soc : 0,
-                                0, 100, false, s_as48_value[19]);
-        if (m_dash_battery_value) {
-            if (m_battery_filter_valid)
-                lv_label_set_text_fmt(m_dash_battery_value, "%d%%", battery_soc);
-            else
-                lv_label_set_text(m_dash_battery_value, "--%");
+        float steering_degrees = d.steering_angle_deg;
+        while (steering_degrees > 180.0f) steering_degrees -= 360.0f;
+        while (steering_degrees < -180.0f) steering_degrees += 360.0f;
+        if (!d.steering_valid) {
+            steering_degrees =
+                ((float)d.can_command_right - (float)d.can_command_left) *
+                90.0f / 2000.0f;
         }
-        if (m_dash_battery_voltage_value) {
-            if (m_battery_filter_valid)
-                lv_label_set_text_fmt(m_dash_battery_voltage_value, "%u.%uV",
-                    battery_display_decivolts / 10,
-                    battery_display_decivolts % 10);
+        steering_degrees = std::clamp(steering_degrees, -90.0f, 90.0f);
+        if (m_dash_steering_gauge)
+            draw_dashboard_dial(m_dash_steering_gauge, 230, 93,
+                                steering_degrees, -90, 90, false);
+        const int average_rpm = d.can_motion_valid
+            ? std::clamp((abs((int)d.can_motor1_rpm) +
+                          abs((int)d.can_motor2_rpm)) / 2, 0, 5000)
+            : 0;
+        if (m_dash_rpm_gauge)
+            draw_dashboard_dial(m_dash_rpm_gauge, 229, 150,
+                                average_rpm, 0, 5000, true);
+        if (m_dash_rpm_value) {
+            if (d.can_motion_valid)
+                lv_label_set_text_fmt(m_dash_rpm_value, "%d rpm", average_rpm);
             else
-                lv_label_set_text(m_dash_battery_voltage_value, "--.-V");
+                lv_label_set_text(m_dash_rpm_value, "---- rpm");
+        }
+        const int battery_gauge_soc = m_battery_filter_valid ? battery_soc : -1;
+        const int battery_warning_soc = std::clamp(
+            (int)lroundf(as48SettingValue(19)), 0, 100);
+        if (m_dash_battery_gauge &&
+            (m_dash_battery_gauge_soc != battery_gauge_soc ||
+             m_dash_battery_gauge_warning != battery_warning_soc)) {
+            draw_dashboard_dial(m_dash_battery_gauge, 167, 101,
+                                battery_gauge_soc >= 0 ? battery_gauge_soc : 0,
+                                0, 100, false, battery_warning_soc);
+            m_dash_battery_gauge_soc = (int16_t)battery_gauge_soc;
+            m_dash_battery_gauge_warning = (int16_t)battery_warning_soc;
+        }
+        const uint16_t battery_text_voltage = m_battery_filter_valid
+            ? battery_display_decivolts : 0xFFFFu;
+        if (m_dash_battery_voltage_value &&
+            (m_dash_battery_text_soc != battery_gauge_soc ||
+             m_dash_battery_text_voltage != battery_text_voltage)) {
+            if (m_battery_filter_valid)
+                lv_label_set_text_fmt(m_dash_battery_voltage_value,
+                                      "%d%%  %u.%uV", battery_soc,
+                                      battery_display_decivolts / 10,
+                                      battery_display_decivolts % 10);
+            else
+                lv_label_set_text(m_dash_battery_voltage_value, "--%  --.-V");
+            m_dash_battery_text_soc = (int16_t)battery_gauge_soc;
+            m_dash_battery_text_voltage = battery_text_voltage;
         }
         if (m_dash_current_gauge)
             draw_dashboard_dial(m_dash_current_gauge, 167, 101,
@@ -3232,21 +4331,129 @@ void AS500UI::update(const robot_t &d)
         }
         if (m_dash_temperature) {
             if (d.can_rx_ok)
-                lv_label_set_text_fmt(m_dash_temperature, "%u °C",
-                                      (unsigned)d.can_fet_temperature_c);
+                lv_label_set_text_fmt(m_dash_temperature, "%d °C",
+                                      (int)d.can_fet_temperature_c);
             else
                 lv_label_set_text(m_dash_temperature, "-- °C");
         }
-        if(m_dash_pitch)
-            lv_label_set_text_fmt(m_dash_pitch,d.imu_valid?"%+.1f°":"--.-°",
-                                  (double)d.imu_pitch_deg);
-        if(m_dash_roll)
-            lv_label_set_text_fmt(m_dash_roll,d.imu_valid?"%+.1f°":"--.-°",
-                                  (double)d.imu_roll_deg);
-        if (m_dash_brake) {
+        const int8_t parking_brake_visual =
+            (d.can_motion_valid && d.can_motion_brake_applied) ? 1 : 0;
+        if (m_dash_parking_brake &&
+            m_dash_parking_brake_visual != parking_brake_visual) {
+            const lv_color_t brake_color = lv_color_hex(
+                parking_brake_visual ? 0xE32626 : 0x9AA6A1);
+            lv_obj_set_style_border_color(m_dash_parking_brake,
+                                          brake_color, 0);
+            lv_obj_t *parking_p = lv_obj_get_child(m_dash_parking_brake, 0);
+            if (parking_p)
+                lv_obj_set_style_text_color(parking_p, brake_color, 0);
+            m_dash_parking_brake_visual = parking_brake_visual;
+        }
+        m_dash_imu_valid = d.imu_valid;
+        m_dash_pitch_deg = d.imu_pitch_deg;
+        m_dash_roll_deg = d.imu_roll_deg;
+        set_tilt_label(m_dash_pitch, d.imu_valid, d.imu_pitch_deg);
+        set_tilt_label(m_dash_roll, d.imu_valid, d.imu_roll_deg);
+        draw_tilt_level(m_dash_pitch_level, d.imu_pitch_deg,
+                        d.imu_valid, true);
+        draw_tilt_level(m_dash_roll_level, d.imu_roll_deg,
+                        d.imu_valid, false);
+        const uint8_t new_analog_raw[kAnalogChannelCount] = {
+            d.interface_throttle1, d.interface_throttle2,
+            d.interface_vr1, d.interface_vr2
+        };
+        const bool analog_raw_changed =
+            memcmp(s_analog_raw, new_analog_raw, sizeof(s_analog_raw)) != 0;
+        memcpy(s_analog_raw, new_analog_raw, sizeof(s_analog_raw));
+        memcpy(m_analog_raw, new_analog_raw, sizeof(m_analog_raw));
+        if (analog_raw_changed && m_analog_settings &&
+            !lv_obj_has_flag(m_analog_settings, LV_OBJ_FLAG_HIDDEN))
+            refreshAnalogSettings();
+
+        const bool speed_limit_valid = d.interface_analog_valid;
+        const uint8_t calibrated_vr1 = calibratedAnalogValue(2,
+                                                              d.interface_vr1);
+        const int speed_limit_percent = speed_limit_valid
+            ? ((int)calibrated_vr1 * 100 + 127) / 255 : 0;
+        draw_analog_level_gauge(m_dash_speed_limit_gauge,
+                                speed_limit_valid ? speed_limit_percent : -1,
+                                0);
+        if (m_dash_speed_limit_value) {
+            if (speed_limit_valid)
+                lv_label_set_text_fmt(m_dash_speed_limit_value, "%d%%",
+                                      speed_limit_percent);
+            else
+                lv_label_set_text(m_dash_speed_limit_value, "--%");
+        }
+        const uint8_t calibrated_vr2 = calibratedAnalogValue(3,
+                                                              d.interface_vr2);
+        const int spray_percent = d.interface_analog_valid
+            ? ((int)calibrated_vr2 * 100 + 127) / 255 : 0;
+        draw_analog_level_gauge(m_dash_spray_gauge,
+                                d.interface_analog_valid ? spray_percent : -1,
+                                2);
+        if (m_dash_spray_value) {
+            if (d.interface_analog_valid)
+                lv_label_set_text_fmt(m_dash_spray_value, "%d%%", spray_percent);
+            else
+                lv_label_set_text(m_dash_spray_value, "--%");
+        }
+        const bool output_valid = d.interface_analog_valid;
+        const bool left_signal = output_valid &&
+            (d.interface_gpio_output_state &
+             AS500_IO_OUTPUT_LEFT_SIGNAL_MASK) != 0;
+        const bool right_signal = output_valid &&
+            (d.interface_gpio_output_state &
+             AS500_IO_OUTPUT_RIGHT_SIGNAL_MASK) != 0;
+        if (m_dash_turn_left)
+            lv_obj_set_style_text_color(m_dash_turn_left,
+                lv_color_hex(left_signal ? 0x20B85A : 0xAAB5B1), 0);
+        if (m_dash_turn_right)
+            lv_obj_set_style_text_color(m_dash_turn_right,
+                lv_color_hex(right_signal ? 0x20B85A : 0xAAB5B1), 0);
+        if (m_dash_tilt_tile && m_dash_tilt_alarm_visual != (int8_t)d.tilt_alarm) {
+            const bool alarm = d.tilt_alarm != 0;
+            const lv_color_t bg = lv_color_hex(alarm ? 0xD64545 : 0xF7F9F7);
+            const lv_color_t fg = lv_color_hex(alarm ? 0xFFFFFF : 0x83918C);
+            lv_obj_set_style_bg_color(m_dash_tilt_tile, bg, 0);
+            lv_obj_set_style_border_color(m_dash_tilt_tile,
+                                          lv_color_hex(alarm ? 0xA62F2F : 0xCED7D1), 0);
+            lv_obj_set_style_text_color(m_dash_tilt, fg, 0);
+            if (m_dash_tilt_caption) {
+                lv_canvas_fill_bg(m_dash_tilt_caption, bg, LV_OPA_COVER);
+                const char *caption = "경사";
+                const int caption_w = ycb_hangul_measure(caption, 2);
+                ycb_hangul_draw(m_dash_tilt_caption, (128 - caption_w) / 2, 4,
+                                lv_color_hex(alarm ? 0xFFFFFF : 0x465650), bg,
+                                caption, 2, false);
+                lv_obj_invalidate(m_dash_tilt_caption);
+            }
+            m_dash_tilt_alarm_visual = (int8_t)d.tilt_alarm;
+        }
+        if (m_dash_brake_tile && m_dash_brake) {
             const bool emergency = d.can_emergency || d.gpio_emergency;
-            lv_obj_set_style_text_color(m_dash_brake, lv_color_hex(
-                emergency ? 0xD64545 : 0x83918C), 0);
+            const bool blink_on = ((esp_timer_get_time() / 500000) & 1) == 0;
+            const int8_t visual = emergency ? (blink_on ? 1 : 2) : 0;
+            if (m_dash_brake_visual != visual) {
+                const bool alarm_on = visual == 1;
+                const lv_color_t bg = lv_color_hex(alarm_on ? 0xD64545 : 0xF7F9F7);
+                lv_obj_set_style_bg_color(m_dash_brake_tile, bg, 0);
+                lv_obj_set_style_border_color(m_dash_brake_tile,
+                    lv_color_hex(alarm_on ? 0xA62F2F : 0xCED7D1), 0);
+                lv_obj_set_style_text_color(m_dash_brake,
+                    lv_color_hex(alarm_on ? 0xFFFFFF : 0x83918C), 0);
+                if (m_dash_brake_caption) {
+                    lv_canvas_fill_bg(m_dash_brake_caption, bg, LV_OPA_COVER);
+                    const char *caption = "비상정지";
+                    const int caption_w = ycb_hangul_measure(caption, 2);
+                    ycb_hangul_draw(m_dash_brake_caption,
+                                    (128 - caption_w) / 2, 4,
+                                    lv_color_hex(alarm_on ? 0xFFFFFF : 0x465650),
+                                    bg, caption, 2, false);
+                    lv_obj_invalidate(m_dash_brake_caption);
+                }
+                m_dash_brake_visual = visual;
+            }
         }
         if (m_drive_icon) {
             const int left = d.can_command_left;
@@ -3574,8 +4781,7 @@ void AS500UI::update(const robot_t &d)
     lv_label_set_text(m_dir_txt, dir_text);
     lv_obj_set_style_text_color(m_dir_txt, dir_color, LV_PART_MAIN);
 
-    /* Display normalized target values for monitoring only. AS500 does not
-       transmit these values to the motor driver. */
+    /* Display the normalized target values sent by ESP32-P4 over 0x701. */
     int pct_l = d.can_command_left / 10;
     int pct_r = d.can_command_right / 10;
     if (pct_l > 100) pct_l = 100;

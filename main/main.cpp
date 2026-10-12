@@ -43,6 +43,7 @@ extern "C" {
 
 #include "ui/as500_ui.h"        /* robot_t, robot_state_t, AS500UI  */
 #include "can/as500_can.h"      /* AS500Can                            */
+#include "can/drive_timing.h"
 #include "manual_input.h"
 #include "remote_drive.h"
 #include "follow_startup.h"
@@ -155,18 +156,45 @@ static bool              g_usb_serial_ready = false;
 static bool              g_estop_gpio_ready = false;
 static bool              g_vacuum_gpio_ready = false;
 
-static void imu_task(void *)
+static constexpr const char *kAuxNvsNamespace = "as500_aux";
+static constexpr const char *kAuxNvsStateKey = "relay_state";
+
+static uint8_t auxiliary_state_bits(const robot_t &state)
 {
-    while (true) {
-        float pitch=0.0f,roll=0.0f;
-        const bool valid=g_mpu6050_ready&&g_mpu6050.update()&&
-                         g_mpu6050.getTilt(&pitch,&roll);
-        xSemaphoreTake(g_lock,portMAX_DELAY);
-        g_bot.imu_valid=valid;
-        if(valid){g_bot.imu_pitch_deg=pitch;g_bot.imu_roll_deg=roll;}
-        xSemaphoreGive(g_lock);
-        vTaskDelay(pdMS_TO_TICKS(20));
+    return (state.pump_on ? AS500_RELAY_PUMP_MASK : 0u) |
+           (state.blower_on ? AS500_RELAY_BLOWER_MASK : 0u) |
+           (state.engine_fan_on ? AS500_RELAY_ENGINE_FAN_MASK : 0u);
+}
+
+static void save_auxiliary_state(const robot_t &state)
+{
+    nvs_handle_t nvs = 0;
+    esp_err_t err = nvs_open(kAuxNvsNamespace, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, kAuxNvsStateKey, auxiliary_state_bits(state));
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
     }
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "Auxiliary state save failed: %s", esp_err_to_name(err));
+}
+
+static void restore_auxiliary_state()
+{
+    uint8_t state = 0;
+    nvs_handle_t nvs = 0;
+    const esp_err_t open_err = nvs_open(kAuxNvsNamespace, NVS_READONLY, &nvs);
+    if (open_err == ESP_OK) {
+        if (nvs_get_u8(nvs, kAuxNvsStateKey, &state) != ESP_OK) state = 0;
+        nvs_close(nvs);
+    }
+    state &= AS500_RELAY_P4_COMMAND_MASK;
+    g_bot.pump_on = (state & AS500_RELAY_PUMP_MASK) != 0;
+    g_bot.blower_on = (state & AS500_RELAY_BLOWER_MASK) != 0;
+    g_bot.engine_fan_on = (state & AS500_RELAY_ENGINE_FAN_MASK) != 0;
+    ESP_LOGI(TAG, "Auxiliary state restored: pump=%u blower=%u fan=%u",
+             g_bot.pump_on ? 1u : 0u, g_bot.blower_on ? 1u : 0u,
+             g_bot.engine_fan_on ? 1u : 0u);
 }
 
 static void set_vacuum_output(bool on)
@@ -717,6 +745,7 @@ static void apply_hmi_command(control_cmd_t cmd)
     const bool auxiliary_command = cmd == CMD_VACUUM_TOGGLE ||
         cmd == CMD_HAZARD_TOGGLE || cmd == CMD_HORN_ON || cmd == CMD_HORN_OFF ||
         cmd == CMD_PUMP_TOGGLE || cmd == CMD_BLOWER_TOGGLE ||
+        cmd == CMD_ENGINE_FAN_TOGGLE ||
         cmd == CMD_HEADLIGHT_TOGGLE || cmd == CMD_PARKING_LIGHT_TOGGLE;
     if (!auxiliary_command) {
         if (g_manual_jog.active()) g_jog_force_zero = true;
@@ -751,6 +780,7 @@ static void apply_hmi_command(control_cmd_t cmd)
 
     bool vacuum_changed = false;
     bool auxiliary_changed = false;
+    bool persistent_auxiliary_changed = false;
     switch (cmd) {
     case CMD_ESTOP:
         g_follow_enabled = false;
@@ -784,8 +814,9 @@ static void apply_hmi_command(control_cmd_t cmd)
     case CMD_HAZARD_TOGGLE: local.hazard_on = !local.hazard_on; auxiliary_changed = true; break;
     case CMD_HORN_ON:       local.horn_on = true; auxiliary_changed = true; break;
     case CMD_HORN_OFF:      local.horn_on = false; auxiliary_changed = true; break;
-    case CMD_PUMP_TOGGLE:   local.pump_on = !local.pump_on; auxiliary_changed = true; break;
-    case CMD_BLOWER_TOGGLE: local.blower_on = !local.blower_on; auxiliary_changed = true; break;
+    case CMD_PUMP_TOGGLE:   local.pump_on = !local.pump_on; auxiliary_changed = true; persistent_auxiliary_changed = true; break;
+    case CMD_BLOWER_TOGGLE: local.blower_on = !local.blower_on; auxiliary_changed = true; persistent_auxiliary_changed = true; break;
+    case CMD_ENGINE_FAN_TOGGLE: local.engine_fan_on = !local.engine_fan_on; auxiliary_changed = true; persistent_auxiliary_changed = true; break;
     case CMD_HEADLIGHT_TOGGLE: local.headlight_on = !local.headlight_on; auxiliary_changed = true; break;
     case CMD_PARKING_LIGHT_TOGGLE: local.parking_light_on = !local.parking_light_on; auxiliary_changed = true; break;
     case CMD_FORWARD:
@@ -829,10 +860,12 @@ static void apply_hmi_command(control_cmd_t cmd)
         g_bot.horn_on = local.horn_on;
         g_bot.pump_on = local.pump_on;
         g_bot.blower_on = local.blower_on;
+        g_bot.engine_fan_on = local.engine_fan_on;
         g_bot.headlight_on = local.headlight_on;
         g_bot.parking_light_on = local.parking_light_on;
         xSemaphoreGive(g_lock);
     }
+    if (persistent_auxiliary_changed) save_auxiliary_state(local);
     if (vacuum_changed) set_vacuum_output(local.vacuum_on);
 }
 
@@ -947,6 +980,13 @@ static void robot_task(void *arg)
     bool uart_timeout_reported = false;
     int64_t last_can_status_rx = 0;
     int64_t last_can_command_tx = esp_timer_get_time();
+    int64_t last_io_command_tx = 0;
+    int64_t tilt_over_since_us = 0;
+    uint8_t tilt_alarm = 0;
+    uint8_t interface_fnr = AS500_FNR_NEUTRAL;
+    bool interface_fnr_valid = false;
+    bool interface_emergency_armed = false;
+    bool throttle_override_active = false;
     int16_t can_output_left = 0;
     int16_t can_output_right = 0;
     bool manual_ramp_active = false;
@@ -990,16 +1030,159 @@ static void robot_task(void *arg)
         xSemaphoreGive(g_lock);
 
         const AS500Can::Status can_status = g_can.pollStatus();
+        interface_fnr = can_status.interface_fnr;
+        interface_fnr_valid = can_status.interface_fnr_valid;
+        /* The Interface input image is zero until its PCA9555 scan is ready.
+           IOI_4 is an NC E-stop input, so accepting that startup zero would
+           send a false E-stop which the STM32 intentionally latches. Arm the
+           input only after observing the normal/high state at least once. */
+        if (can_status.interface_fnr_valid &&
+            (can_status.interface_gpio_input_state &
+             AS500_IO_INPUT_EMERGENCY_NORMAL_MASK) != 0) {
+            interface_emergency_armed = true;
+        }
+        AS500UI::setVehicleFNR(
+            interface_fnr_valid && interface_fnr == AS500_FNR_FORWARD ? CMD_FORWARD :
+            interface_fnr_valid && interface_fnr == AS500_FNR_REVERSE ? CMD_REVERSE :
+            CMD_NONE);
+        AS500UI::setInterfaceCruisePressed(
+            can_status.interface_cruise_pressed);
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        g_bot.steering_angle_raw = can_status.steering_angle_raw;
+        g_bot.steering_angle_deg = can_status.steering_angle_deg;
+        g_bot.steering_speed_dps = can_status.steering_speed_dps;
+        g_bot.steering_turns = can_status.steering_turns;
+        g_bot.steering_temperature_c = can_status.steering_temperature_c;
+        g_bot.steering_age_ms = can_status.steering_age_ms;
+        g_bot.steering_valid = can_status.steering_valid;
+        g_bot.can_motor1_rpm = can_status.motor1_rpm;
+        g_bot.can_motor2_rpm = can_status.motor2_rpm;
+        g_bot.can_motion_age_ms = can_status.motion_age_ms;
+        g_bot.can_motion_valid = can_status.motion_valid;
+        g_bot.can_motion_brake_applied = can_status.motion_brake_applied;
+        g_bot.can_emergency = can_status.motion_valid &&
+                              can_status.motion_emergency;
+        g_bot.interface_gpio_input_state = can_status.interface_gpio_input_state;
+        g_bot.interface_gpio_output_state = can_status.interface_gpio_output_state;
+        g_bot.interface_throttle1 = can_status.interface_throttle1;
+        g_bot.interface_throttle2 = can_status.interface_throttle2;
+        g_bot.interface_vr1 = can_status.interface_vr1;
+        g_bot.interface_vr2 = can_status.interface_vr2;
+        g_bot.interface_analog_age_ms = can_status.interface_analog_age_ms;
+        g_bot.interface_analog_valid = can_status.interface_analog_valid;
+        g_bot.imu_valid = can_status.interface_imu_valid;
+        if (can_status.interface_imu_valid) {
+            g_bot.imu_pitch_deg = can_status.interface_pitch_deg +
+                                  AS500UI::as48SettingValue(4);
+            g_bot.imu_roll_deg = can_status.interface_roll_deg +
+                                 AS500UI::as48SettingValue(5);
+        }
+        xSemaphoreGive(g_lock);
+
+        /* A non-zero pedal value has priority over cruise. Start/maintain
+           manual travel from FNR while either throttle is present. When both
+           return to zero, release pedal control; cruise may then keep the
+           selected direction active while its button remains held. */
+        const uint8_t interface_throttle = can_status.interface_analog_valid
+            ? std::max(AS500UI::calibratedAnalogValue(
+                           0, can_status.interface_throttle1),
+                       AS500UI::calibratedAnalogValue(
+                           1, can_status.interface_throttle2))
+            : 0u;
+        const bool throttle_present = interface_throttle != 0u;
+        const control_cmd_t throttle_direction =
+            interface_fnr_valid && interface_fnr == AS500_FNR_FORWARD
+                ? CMD_FORWARD
+                : interface_fnr_valid && interface_fnr == AS500_FNR_REVERSE
+                    ? CMD_REVERSE : CMD_NONE;
+        if (throttle_present && throttle_direction != CMD_NONE) {
+            robot_state_t current_state;
+            bool emergency_active;
+            xSemaphoreTake(g_lock, portMAX_DELAY);
+            current_state = g_bot.state;
+            emergency_active = g_bot.gpio_emergency || g_bot.can_emergency ||
+                               current_state == S_ESTOP;
+            xSemaphoreGive(g_lock);
+            const robot_state_t desired_state = throttle_direction == CMD_FORWARD
+                ? S_MAN_FWD : S_MAN_REV;
+            if (!emergency_active && current_state != desired_state)
+                apply_hmi_command(throttle_direction);
+        } else if (throttle_present) {
+            /* Pedal input with neutral/invalid FNR must never fall through to
+               cruise. */
+            apply_hmi_command(CMD_STOP);
+        } else if (throttle_override_active && !AS500UI::cruisePressed()) {
+            apply_hmi_command(CMD_STOP);
+        }
+        throttle_override_active = throttle_present;
+
+        /* Match the former Interface alarm policy, but use P4 settings:
+           an enabled threshold must be exceeded continuously for 3 seconds. */
+        const int64_t tilt_now_us = esp_timer_get_time();
+        const bool tilt_enabled = AS500UI::as48SettingValue(3) >= 0.5f;
+        const float pitch_abs = fabsf(can_status.interface_pitch_deg +
+                                      AS500UI::as48SettingValue(4));
+        const float roll_abs = fabsf(can_status.interface_roll_deg +
+                                     AS500UI::as48SettingValue(5));
+        const bool pitch_over = can_status.interface_imu_valid && tilt_enabled &&
+                                pitch_abs >= AS500UI::as48SettingValue(1);
+        const bool roll_over = can_status.interface_imu_valid && tilt_enabled &&
+                               roll_abs >= AS500UI::as48SettingValue(1);
+        if (pitch_over || roll_over) {
+            if (tilt_over_since_us == 0) tilt_over_since_us = tilt_now_us;
+            if (tilt_now_us - tilt_over_since_us >= 3000000)
+                tilt_alarm = pitch_over ? 1u : 2u;
+        } else {
+            tilt_over_since_us = 0;
+            tilt_alarm = 0;
+        }
+        xSemaphoreTake(g_lock, portMAX_DELAY);
+        g_bot.tilt_alarm = tilt_alarm;
+        xSemaphoreGive(g_lock);
+
+        if (last_io_command_tx == 0 ||
+            tilt_now_us - last_io_command_tx >=
+                (int64_t)AS500_CAN_IO_COMMAND_PERIOD_MS * 1000) {
+            bool hazard_requested = false;
+            xSemaphoreTake(g_lock, portMAX_DELAY);
+            hazard_requested = g_bot.hazard_on;
+            xSemaphoreGive(g_lock);
+
+            const bool left_requested = can_status.interface_fnr_valid &&
+                (can_status.interface_gpio_input_state &
+                 AS500_IO_INPUT_LEFT_MASK) != 0;
+            const bool right_requested = can_status.interface_fnr_valid &&
+                (can_status.interface_gpio_input_state &
+                 AS500_IO_INPUT_RIGHT_MASK) != 0;
+            /* 500 ms ON / 500 ms OFF. 0x501 reports the physical relay
+               state back so the dashboard arrows follow the actual output. */
+            const bool signal_on = ((tilt_now_us / 500000) & 1) == 0;
+            uint8_t output_control = tilt_alarm
+                ? AS500_IO_CONTROL_BUZZER_MASK : 0u;
+            /* IOO_3 (RELAY4) is the brake-light output on the Interface
+               board. Follow the STM32-reported EMB state so the relay
+               changes only when the brake is actually applied/released. */
+            if (can_status.motion_valid && can_status.motion_brake_applied)
+                output_control |= AS500_IO_CONTROL_BRAKE_LIGHT_MASK;
+            if (signal_on) {
+                if (hazard_requested || left_requested)
+                    output_control |= AS500_IO_CONTROL_LEFT_SIGNAL_MASK;
+                if (hazard_requested || right_requested)
+                    output_control |= AS500_IO_CONTROL_RIGHT_SIGNAL_MASK;
+            }
+            g_can.sendInterfaceOutputCommand(output_control);
+            last_io_command_tx = tilt_now_us;
+        }
         if (can_status.valid) {
             last_can_status_rx = esp_timer_get_time();
-            if (!gpio_emergency && !can_status.emergency &&
+            if (!gpio_emergency &&
                 g_manual_startup.observe(last_can_status_rx, can_status.current_received_us,
                     can_status.current_deciamps, can_status.motor1_rpm, can_status.motor2_rpm)) {
                 ESP_LOGI("STARTUP", "ESTIMATED peak_dA=%d current_dA=%u rpm=%d/%d",
                     g_manual_startup.evidence.peak, can_status.current_deciamps,
                     can_status.motor1_rpm, can_status.motor2_rpm);
             }
-            if (!gpio_emergency && !can_status.emergency &&
+            if (!gpio_emergency &&
                 g_follow_startup.assist.observe(last_can_status_rx,
                     can_status.current_received_us, can_status.current_deciamps,
                     can_status.motor1_rpm, can_status.motor2_rpm)) {
@@ -1010,27 +1193,20 @@ static void robot_task(void *arg)
             xSemaphoreTake(g_lock, portMAX_DELAY);
             g_bot.can_voltage_decivolts = can_status.battery_decivolts;
             g_bot.can_current_deciamps = can_status.current_deciamps;
-            g_bot.can_motor1_rpm = can_status.motor1_rpm;
-            g_bot.can_motor2_rpm = can_status.motor2_rpm;
-            g_bot.can_motor_temperature_c = can_status.motor_temperature_c;
             g_bot.can_fet_temperature_c = can_status.fet_temperature_c;
+            g_bot.can_relay_status = can_status.relay_status;
+            g_bot.can_switch_status = can_status.switch_status;
+            g_bot.can_error_code = can_status.error_code;
             g_bot.can_brake_applied = can_status.brake_applied;
-            g_bot.can_emergency = can_status.emergency;
             g_bot.can_rx_ok = true;
             g_bot.can_rx_age_ms = 0;
-            if (can_status.emergency) {
-                g_follow_enabled = false;
-                g_bot.follow_enabled = false;
-                g_bot.sL = g_bot.sR = 0;
-                g_bot.state = S_ESTOP;
-            }
             xSemaphoreGive(g_lock);
         }
         const int64_t can_age_ms = last_can_status_rx == 0 ? 65535 :
             (esp_timer_get_time() - last_can_status_rx) / 1000;
         xSemaphoreTake(g_lock, portMAX_DELAY);
         g_bot.can_rx_age_ms = can_age_ms > 65535 ? 65535 : (uint16_t)can_age_ms;
-        /* CAN display/telemetry is valid only while ID 0x5B8 is fresh. */
+        /* CAN display/telemetry is valid only while ID 0x5A0 is fresh. */
         g_bot.can_rx_ok = last_can_status_rx != 0 && can_age_ms <= 300;
         xSemaphoreGive(g_lock);
 
@@ -1335,10 +1511,11 @@ static void robot_task(void *arg)
             xSemaphoreGive(g_lock);
         }
 
-        /* Periodically calculate target values for HMI/UART monitoring only.
-           AS500 does not transmit these values to a motor driver. */
+        /* Calculate and transmit the ESP32-P4-owned 0x701 drive command. */
         const int64_t can_command_now = esp_timer_get_time();
-        if (g_manual_stop_pending || can_command_now - last_can_command_tx >= 100000) {
+        if (g_manual_stop_pending ||
+            can_command_now - last_can_command_tx >=
+                (int64_t)AS500_CAN_DRIVE_COMMAND_PERIOD_MS * 1000) {
             int16_t command_left;
             int16_t command_right;
             robot_state_t command_state;
@@ -1353,13 +1530,16 @@ static void robot_task(void *arg)
             command_gpio_emergency = g_bot.gpio_emergency;
             command_can_emergency = g_bot.can_emergency;
             xSemaphoreGive(g_lock);
-            /* The STM32 latches byte7 bit7 and powers the motor stage off
-               until it is rebooted. Use that bit only for an explicit
-               E-STOP. A missing follow signal is a zero-speed normal stop so
-               the drive can resume when valid ranging data returns. */
+            const bool command_interface_emergency =
+                interface_emergency_armed && can_status.interface_fnr_valid &&
+                (can_status.interface_gpio_input_state &
+                 AS500_IO_INPUT_EMERGENCY_NORMAL_MASK) == 0;
+            /* E-stop is carried only by 0x701 byte6 bit4. Byte7 remains the
+               auxiliary-relay command port. */
             const bool command_emergency = command_state == S_ESTOP ||
                                            command_gpio_emergency ||
-                                           command_can_emergency;
+                                           command_can_emergency ||
+                                           command_interface_emergency;
             const bool manual_command = is_manual_drive_state(command_state);
             const bool manual_pivot = command_state == S_MAN_LEFT ||
                                       command_state == S_MAN_RIGHT;
@@ -1493,21 +1673,87 @@ static void robot_task(void *arg)
                     AS500UI::settingValue(24),MOTOR_MAX_RPM);
             }
 
-            const int16_t tx_left = rpm_to_can_command(can_output_left);
-            const int16_t tx_right = rpm_to_can_command(can_output_right);
+            /* A pedal value has priority. Cruise supplies a full-scale demand
+               only while both Throttle1 and Throttle2 are zero. */
+            const uint8_t throttle_raw = drive_snapshot.interface_analog_valid
+                ? std::max(AS500UI::calibratedAnalogValue(
+                               0, drive_snapshot.interface_throttle1),
+                           AS500UI::calibratedAnalogValue(
+                               1, drive_snapshot.interface_throttle2))
+                : 0u;
+            const uint8_t drive_demand_raw = throttle_raw != 0u
+                ? throttle_raw
+                : (AS500UI::cruisePressed() ? 255u : 0u);
+            can_output_left = (int16_t)(((int32_t)can_output_left *
+                                         drive_demand_raw) / 255);
+            can_output_right = (int16_t)(((int32_t)can_output_right *
+                                          drive_demand_raw) / 255);
+
+            const uint8_t speed_limit_raw = drive_snapshot.interface_analog_valid
+                ? AS500UI::calibratedAnalogValue(
+                      2, drive_snapshot.interface_vr1) : 0u;
+            can_output_left = (int16_t)(((int32_t)can_output_left *
+                                         speed_limit_raw) / 255);
+            can_output_right = (int16_t)(((int32_t)can_output_right *
+                                          speed_limit_raw) / 255);
+
+            int16_t tx_left = rpm_to_can_command(can_output_left);
+            int16_t tx_right = rpm_to_can_command(can_output_right);
+            const uint8_t tx_fnr = interface_fnr_valid
+                ? interface_fnr : AS500_FNR_NEUTRAL;
+            if (tx_fnr == AS500_FNR_NEUTRAL) {
+                tx_left = tx_right = 0;
+            } else {
+                /* FNR owns longitudinal direction. Preserve the left/right
+                   steering ratio, but reverse the complete pair when its
+                   current travel direction disagrees with the selector. */
+                const int pair_sum = (int)tx_left + (int)tx_right;
+                if ((tx_fnr == AS500_FNR_FORWARD && pair_sum < 0) ||
+                    (tx_fnr == AS500_FNR_REVERSE && pair_sum > 0)) {
+                    tx_left = (int16_t)-tx_left;
+                    tx_right = (int16_t)-tx_right;
+                }
+            }
             xSemaphoreTake(g_lock, portMAX_DELAY);
             g_bot.can_command_left = tx_left;
             g_bot.can_command_right = tx_right;
             xSemaphoreGive(g_lock);
-            const bool tx_ok = false; // AS500 HMI does not transmit motor commands.
+            const bool timing_follow = follow_command;
+            const uint8_t accel_raw = (uint8_t)DriveTiming::encode(
+                AS500UI::settingValue(DriveTiming::accelIndex(timing_follow)));
+            const uint8_t decel_raw = (uint8_t)DriveTiming::encode(
+                AS500UI::settingValue(DriveTiming::decelIndex(timing_follow)));
+            uint8_t input_port = (uint8_t)
+                (drive_snapshot.interface_gpio_input_state & 0xFFu);
+            /* Interface IOI_4 is NC (1=normal, 0=E-stop). Normalize the
+               forwarded 0x701 bit to 1=E-stop and avoid a boot-time trip. */
+            input_port &= (uint8_t)~AS500_DRIVE_INPUT_ESTOP_MASK;
+            if (command_interface_emergency)
+                input_port |= AS500_DRIVE_INPUT_ESTOP_MASK;
+            /* Cruise is momentary. Either physical Interface switch or the
+               P4 touch button may assert it; releasing both clears it. */
+            input_port &= (uint8_t)~AS500_DRIVE_INPUT_CRUISE_MASK;
+            if (AS500UI::cruisePressed())
+                input_port |= AS500_DRIVE_INPUT_CRUISE_MASK;
+            /* Byte 7 is a command, not a copy of the 0x5A0 feedback byte.
+               RY1/RY2/RY3 belong exclusively to the STM32. */
+            uint8_t relay_port = 0U;
+            if (drive_snapshot.pump_on)
+                relay_port |= AS500_RELAY_PUMP_MASK;
+            if (drive_snapshot.blower_on)
+                relay_port |= AS500_RELAY_BLOWER_MASK;
+            if (drive_snapshot.engine_fan_on)
+                relay_port |= AS500_RELAY_ENGINE_FAN_MASK;
+            const bool tx_ok = g_can.sendDriveCommand(
+                tx_left, tx_right, accel_raw, decel_raw, tx_fnr,
+                command_emergency, input_port, relay_port);
             robot_t tx_snapshot;
             xSemaphoreTake(g_lock, portMAX_DELAY);
             tx_snapshot = g_bot;
             xSemaphoreGive(g_lock);
             static uint32_t tx_sequence = 0;
             char ctrl[160];
-            // These are calculated target values for monitoring only. They are
-            // never transmitted to a motor driver by the AS500 HMI.
+            // Report the exact values transmitted by the AS500 HMI.
             snprintf(ctrl, sizeof(ctrl),
                      "CTRL,%d,%d,%d,%d,%u,%s,%u,%u,%u,%lu,%u,%u\n",
                      tx_left, tx_right, tx_snapshot.can_motor1_rpm,
@@ -1548,8 +1794,6 @@ static void robot_task(void *arg)
             if (g_usb_serial_ready) write_serial_response(true, pose);
             g_manual_stop_pending = false;
             last_can_command_tx = can_command_now;
-            if (can_command_now - last_can_command_tx >= 100000)
-                last_can_command_tx = can_command_now;
         }
 
         /* Print a compact status line twice per second. */
@@ -1694,6 +1938,7 @@ extern "C" void app_main(void)
     /* ── 공유 Mutex ──────────────────────────────────── */
     g_lock = xSemaphoreCreateMutex();
     assert(g_lock != NULL);
+    restore_auxiliary_state();
 
     /* ESP-NOW receiver: onboard ESP32-C6 through ESP-Hosted/SDIO. */
     if (kEnableHostedEspNow) {
@@ -1852,10 +2097,6 @@ extern "C" void app_main(void)
         robot_task, "robot_ctrl", 8192, NULL, 5, NULL, 1);
     if (robot_task_ok != pdPASS) {
         ESP_LOGE(TAG, "robot_ctrl task creation failed");
-    }
-    if(g_mpu6050_ready){
-        if(xTaskCreatePinnedToCore(imu_task,"mpu6050",4096,NULL,4,NULL,1)!=pdPASS)
-            ESP_LOGE(TAG,"MPU6050 task creation failed");
     }
     if (g_lidar.isReady()) {
         BaseType_t lidar_task_ok = xTaskCreatePinnedToCore(

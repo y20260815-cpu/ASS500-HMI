@@ -587,8 +587,8 @@ esp_err_t bsp_display_new_with_handles(const bsp_display_config_t *config, bsp_l
 
     esp_lcd_panel_handle_t disp_panel = NULL;
 #if CONFIG_BSP_LCD_TYPE_1024_600
-    // create EK79007 control panel
-    ESP_LOGI(TAG, "Install EK79007 LCD control panel");
+    // Create the selected 1024x600 JD9165 panel revision.
+    ESP_LOGI(TAG, "Install JD9165 LCD V%d control panel", LCD_VERSION);
     esp_lcd_dpi_panel_config_t dpi_config = {
             .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,     
             .dpi_clock_freq_mhz = 52,
@@ -609,7 +609,6 @@ esp_err_t bsp_display_new_with_handles(const bsp_display_config_t *config, bsp_l
                 .vsync_pulse_width = 2,                      
                 .vsync_front_porch = 12,                     
             },
-            .flags.use_dma2d = true,
     };
 
     jd9165_vendor_config_t vendor_config = {
@@ -822,7 +821,13 @@ extern bool as500_touch_points(const uint16_t *x, const uint16_t *y,
                                  uint8_t count) __attribute__((weak));
 static void bsp_multitouch_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
-    (void)indev;
+    /* This device is exclusively the LCD touch panel.  Keep the type explicit:
+     * if it is ever observed as KEYPAD, LVGL enters keypad processing without
+     * a group and can monopolize taskLVGL until the watchdog fires. */
+    if (lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+        lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    }
+    data->continue_reading = false;
     esp_lcd_touch_point_data_t points[CONFIG_ESP_LCD_TOUCH_MAX_POINTS] = {0};
     uint16_t x[CONFIG_ESP_LCD_TOUCH_MAX_POINTS] = {0};
     uint16_t y[CONFIG_ESP_LCD_TOUCH_MAX_POINTS] = {0};
@@ -850,6 +855,7 @@ static lv_indev_t *bsp_display_indev_init(lv_display_t *disp)
 
     lv_indev_t *indev = lvgl_port_add_touch(&touch_cfg);
     if (indev) {
+        lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
         lv_indev_set_read_cb(indev, bsp_multitouch_read);
         lv_indev_set_mode(indev, LV_INDEV_MODE_TIMER);
     }

@@ -1,5 +1,14 @@
 # AS500-HMI
 
+## CAN protocol
+
+세 프로젝트(`AS500-HMI`, `AS500-interface`, `AS500-FND Driver`)의 전체 구성과
+차량 CAN ID, payload, 단위, timeout, 보드별 책임은
+[공통 CAN_PROTOCOL.md](../CAN_PROTOCOL.md)에 정리되어 있습니다.
+
+`main/can/can_protocol.h`는 HMI 코드에서 사용하는 정의이며, 현재 구현과 헤더 간
+차이는 통합 문서의 "현재 구현상 주의사항"을 확인하십시오.
+
 ESP32-P4 기반 7인치(1024x600) HMI 프로젝트입니다.
 
 ## 기준 프로젝트
