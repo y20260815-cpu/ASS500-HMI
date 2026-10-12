@@ -2535,8 +2535,9 @@ void AS500UI::createMp3SettingsOverlay()
 
     mp3_label(m_mp3_settings, "MP3 PLAYER", 24, 14, 250, 40,
               &lv_font_montserrat_28, 0x20302C, LV_TEXT_ALIGN_LEFT);
-    m_mp3_status = mp3_label(m_mp3_settings, "USB NOT CONNECTED", 282, 19, 285, 28,
+    m_mp3_status = mp3_label(m_mp3_settings, "USB NOT CONNECTED", 282, 19, 360, 28,
                              &lv_font_montserrat_16, 0xB03A2E, LV_TEXT_ALIGN_RIGHT);
+    lv_label_set_long_mode(m_mp3_status, LV_LABEL_LONG_DOT);
     lv_obj_t *close = lv_btn_create(m_mp3_settings);
     lv_obj_set_pos(close, 660, 10); lv_obj_set_size(close, 44, 40);
     lv_obj_set_style_pad_all(close, 0, 0);
@@ -2602,6 +2603,8 @@ void AS500UI::refreshMp3Settings()
 {
     if (!m_mp3_settings) return;
     auto &player = AS500Mp3Player::instance();
+    m_mp3_revision = player.revision();
+    if (m_mp3_list_offset >= player.trackCount()) m_mp3_list_offset = 0;
     lv_slider_set_value(m_mp3_volume, player.volume(), LV_ANIM_OFF);
     lv_obj_clean(m_mp3_mode);
     mp3_label(m_mp3_mode,
@@ -2609,22 +2612,29 @@ void AS500UI::refreshMp3Settings()
                   ? LV_SYMBOL_SHUFFLE "  RANDOM"
                   : LV_SYMBOL_LIST "  SEQUENTIAL",
               0, 7, 220, 30, &lv_font_montserrat_14, 0xFFFFFF, LV_TEXT_ALIGN_CENTER);
-    if (player.mounted())
-        lv_label_set_text_fmt(m_mp3_status, "%u TRACKS",
+    if (player.lastError() != ESP_OK)
+        lv_label_set_text_fmt(m_mp3_status, "ERROR: %s", esp_err_to_name(player.lastError()));
+    else if (player.mounted() && !player.trackCount())
+        lv_label_set_text(m_mp3_status, "NO MP3 FILES");
+    else if (player.mounted())
+        lv_label_set_text_fmt(m_mp3_status, "%s %u/%u",
+                              player.playing() ? "PLAYING" : player.enabled() ? "STARTING" : "STOPPED",
+                              static_cast<unsigned>(player.currentTrack() + 1),
                               static_cast<unsigned>(player.trackCount()));
     else
-        lv_label_set_text(m_mp3_status, "USB NOT CONNECTED");
+        lv_label_set_text(m_mp3_status, player.enabled() ? "WAITING FOR USB" : "USB NOT CONNECTED");
     lv_obj_set_style_text_color(m_mp3_status,
-        lv_color_hex(player.mounted() ? 0x238636 : 0xB03A2E), 0);
+        lv_color_hex(player.mounted() && player.lastError() == ESP_OK ? 0x238636 : 0xB03A2E), 0);
     for (size_t i = 0; i < 8; ++i) {
         const size_t index = m_mp3_list_offset + i;
-        if (index < player.trackCount()) {
+        char track_name[AS500Mp3Player::kMaxPath];
+        if (player.copyTrackName(index, track_name, sizeof(track_name))) {
             lv_obj_clear_flag(m_mp3_track_buttons[i], LV_OBJ_FLAG_HIDDEN);
             const uint32_t row_color = index == player.currentTrack() ? 0x238636 : 0x61756E;
             lv_obj_set_style_bg_color(m_mp3_track_buttons[i], lv_color_hex(row_color), 0);
             char track_text[224];
             snprintf(track_text, sizeof(track_text), "%02u  %s",
-                     static_cast<unsigned>(index + 1), player.trackName(index));
+                     static_cast<unsigned>(index + 1), track_name);
             if (m_mp3_track_labels[i]) {
                 lv_canvas_fill_bg(m_mp3_track_labels[i], lv_color_hex(row_color), LV_OPA_COVER);
                 ycb_hangul_draw(m_mp3_track_labels[i], 0, 3, lv_color_white(),
@@ -4084,6 +4094,9 @@ void AS500UI::init(bool can_ok)
 void AS500UI::update(const robot_t &d)
 {
     auto &mp3 = AS500Mp3Player::instance();
+    if (m_mp3_settings && !lv_obj_has_flag(m_mp3_settings, LV_OBJ_FLAG_HIDDEN) &&
+        m_mp3_revision != mp3.revision())
+        refreshMp3Settings();
     const int8_t mp3_visual = mp3.enabled() ? (mp3.playing() ? 2 : 1) : 0;
     if (m_mp3_tile && m_dash_wireless && m_mp3_visual != mp3_visual) {
         const uint32_t bg = mp3_visual == 2 ? 0x238636 :

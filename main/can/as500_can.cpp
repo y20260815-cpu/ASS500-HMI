@@ -14,6 +14,7 @@
 #include <stdio.h>
 
 static const char *TAG = "AS500Can";
+static constexpr bool kLogCanRxFrames = false;
 
 static int16_t legacy12ToRpm(uint16_t encoded)
 {
@@ -77,22 +78,24 @@ AS500Can::Status AS500Can::pollStatus()
     twai_message_t message = {};
     while (twai_receive(&message, 0) == ESP_OK) {
         m_last_any_rx_us = esp_timer_get_time();
-        char data_hex[3 * 8 + 1] = {};
-        size_t offset = 0;
-        const unsigned dlc = message.data_length_code > 8 ? 8 :
-                             message.data_length_code;
-        for (unsigned i = 0; i < dlc && offset < sizeof(data_hex); ++i) {
-            const int written = snprintf(data_hex + offset,
-                                         sizeof(data_hex) - offset,
-                                         i == 0 ? "%02X" : " %02X",
-                                         message.data[i]);
-            if (written <= 0) break;
-            offset += (size_t)written;
+        if (kLogCanRxFrames) {
+            char data_hex[3 * 8 + 1] = {};
+            size_t offset = 0;
+            const unsigned dlc = message.data_length_code > 8 ? 8 :
+                                 message.data_length_code;
+            for (unsigned i = 0; i < dlc && offset < sizeof(data_hex); ++i) {
+                const int written = snprintf(data_hex + offset,
+                                             sizeof(data_hex) - offset,
+                                             i == 0 ? "%02X" : " %02X",
+                                             message.data[i]);
+                if (written <= 0) break;
+                offset += (size_t)written;
+            }
+            ESP_LOGI(TAG, "CAN_RX ID=0x%lX%s DLC=%u DATA=%s",
+                     (unsigned long)message.identifier,
+                     message.extd ? " EXT" : "", dlc,
+                     message.rtr ? "RTR" : data_hex);
         }
-        ESP_LOGI(TAG, "CAN_RX ID=0x%lX%s DLC=%u DATA=%s",
-                 (unsigned long)message.identifier,
-                 message.extd ? " EXT" : "", dlc,
-                 message.rtr ? "RTR" : data_hex);
 
         if (!message.extd && !message.rtr &&
             message.identifier == AS500_CAN_ID_IO_STATE &&

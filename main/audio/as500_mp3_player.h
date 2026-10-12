@@ -6,7 +6,12 @@
 
 #include "esp_err.h"
 #include "audio_player.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "usb/msc_host.h"
+#include "usb/msc_host_vfs.h"
 
 class AS500Mp3Player {
 public:
@@ -30,7 +35,9 @@ public:
     void selectTrack(size_t index);
     size_t trackCount() const { return m_track_count.load(); }
     size_t currentTrack() const { return m_current_track.load(); }
-    const char *trackName(size_t index) const;
+    bool copyTrackName(size_t index, char *name, size_t size) const;
+    esp_err_t lastError() const { return m_last_error.load(); }
+    uint32_t revision() const { return m_revision.load(); }
 
 private:
     AS500Mp3Player() = default;
@@ -44,6 +51,8 @@ private:
     esp_err_t ensureAudioReady();
     void playCurrent();
     void playNext();
+    esp_err_t stopPlayback();
+    void reportError(const char *operation, esp_err_t error);
     void loadSettings();
     void saveSettings();
 
@@ -55,8 +64,22 @@ private:
     std::atomic<PlayMode> m_mode{PlayMode::Sequential};
     std::atomic<size_t> m_track_count{0};
     std::atomic<size_t> m_current_track{0};
+    std::atomic<size_t> m_requested_track{0};
+    std::atomic<esp_err_t> m_last_error{ESP_OK};
+    std::atomic<uint32_t> m_revision{0};
+    std::atomic<bool> m_finished{false};
+    std::atomic<uint32_t> m_commands_pending{0};
     char m_tracks[kMaxTracks][kMaxPath]{};
-    void *m_queue = nullptr;
-    void *m_device = nullptr;
-    void *m_vfs = nullptr;
+    size_t m_scan_count = 0;
+    bool m_usb_started = false;
+    bool m_service_ready = false;
+    bool m_msc_installed = false;
+    bool m_audio_created = false;
+    std::atomic<msc_host_device_handle_t> m_disconnected_device{nullptr};
+    bool m_disconnect_pending = false;
+    QueueHandle_t m_queue = nullptr;
+    SemaphoreHandle_t m_tracks_mutex = nullptr;
+    EventGroupHandle_t m_audio_events = nullptr;
+    msc_host_device_handle_t m_device = nullptr;
+    msc_host_vfs_handle_t m_vfs = nullptr;
 };

@@ -384,6 +384,7 @@ private:
     size_t m_mp3_list_offset = 0;
     bool m_mp3_long_pressed = false;
     int8_t m_mp3_visual = -1;
+    uint32_t m_mp3_revision = 0;
     lv_obj_t *m_dash_ros = nullptr;
     lv_obj_t *m_dash_engine_fan_tile = nullptr;
     lv_obj_t *m_dash_engine_fan_caption = nullptr;

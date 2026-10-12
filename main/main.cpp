@@ -64,6 +64,7 @@ extern "C" {
 #include "class/mpu6050/mpu6050.h"
 
 static const char *TAG = "as500";
+static constexpr bool kLogPeriodicControlPose = false;
 static esp_reset_reason_t g_boot_reset_reason = ESP_RST_UNKNOWN;
 
 static const char *reset_reason_text(esp_reset_reason_t reason)
@@ -1762,8 +1763,10 @@ static void robot_task(void *arg)
                      tx_snapshot.can_voltage_decivolts, tx_snapshot.can_current_deciamps,
                      tx_snapshot.can_rx_age_ms, (unsigned long)++tx_sequence,
                      tx_ok ? 1u : 0u, tx_snapshot.can_brake_applied ? 1u : 0u);
-            g_uart.writeLine(ctrl);
-            if (g_usb_serial_ready) write_serial_response(true, ctrl);
+            if (kLogPeriodicControlPose) {
+                g_uart.writeLine(ctrl);
+                if (g_usb_serial_ready) write_serial_response(true, ctrl);
+            }
             static float published_width = -1, published_alpha = -1, published_gate = -1,
                          published_shadow_multiplier = -1;
             const float width = UwbGeometry::kAnchorBaselineCm;
@@ -1790,8 +1793,10 @@ static void robot_task(void *arg)
                 pose_valid ? 1u : 0u,
                 (double)(tx_snapshot.target_distance_cm * 10.0f),
                 (double)tx_snapshot.target_angle_deg, tx_snapshot.dL, tx_snapshot.dR);
-            g_uart.writeLine(pose);
-            if (g_usb_serial_ready) write_serial_response(true, pose);
+            if (kLogPeriodicControlPose) {
+                g_uart.writeLine(pose);
+                if (g_usb_serial_ready) write_serial_response(true, pose);
+            }
             g_manual_stop_pending = false;
             last_can_command_tx = can_command_now;
         }
