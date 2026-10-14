@@ -1166,9 +1166,9 @@ static void robot_task(void *arg)
             if (can_status.motion_valid && can_status.motion_brake_applied)
                 output_control |= AS500_IO_CONTROL_BRAKE_LIGHT_MASK;
             if (signal_on) {
-                if (hazard_requested || left_requested)
+                if (hazard_requested || tilt_alarm || left_requested)
                     output_control |= AS500_IO_CONTROL_LEFT_SIGNAL_MASK;
-                if (hazard_requested || right_requested)
+                if (hazard_requested || tilt_alarm || right_requested)
                     output_control |= AS500_IO_CONTROL_RIGHT_SIGNAL_MASK;
             }
             g_can.sendInterfaceOutputCommand(output_control);
